@@ -9,37 +9,54 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===== Supabase =====
+// ======================
+// Supabase
+// ======================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ===== Apify config =====
+// ======================
+// Apify
+// ======================
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
-const ACTOR_ID = process.env.APIFY_ACTOR_ID;
+const APIFY_ACTOR_ID = process.env.APIFY_ACTOR_ID;
 
-// health check
+// ======================
+// Health check
+// ======================
 app.get("/", (req, res) => {
   res.json({ status: "backend ok" });
 });
 
-// ===== SEARCH ENDPOINT =====
+// ======================
+// SEARCH
+// ======================
 app.post("/search", async (req, res) => {
   try {
     const search = req.body;
     console.log("🔍 Nuova ricerca ricevuta:", search);
 
+    // 🔴 INPUT COMPATIBILE CON L’ACTOR
+    const actorInput = {
+      location_query: search.municipality, // ← FONDAMENTALE
+      operation: search.operation || "vendita",
+      min_price: search.min_price ?? null,
+      max_price: search.max_price ?? null,
+      max_items: search.max_items ?? 1,
+    };
+
     // 1️⃣ Avvia Actor
     const runRes = await axios.post(
-      `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
-      search
+      `https://api.apify.com/v2/acts/${APIFY_ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
+      actorInput
     );
 
     const runId = runRes.data.data.id;
     console.log("🚀 Run avviato:", runId);
 
-    // 2️⃣ Polling run
+    // 2️⃣ Polling stato run
     let runStatus = "RUNNING";
     let runData;
 
@@ -76,7 +93,7 @@ app.post("/search", async (req, res) => {
     const { data: searchRow, error: searchError } = await supabase
       .from("searches")
       .insert({
-        query: search,
+        query: actorInput,
         run_id: runId,
       })
       .select()
@@ -84,7 +101,7 @@ app.post("/search", async (req, res) => {
 
     if (searchError) throw searchError;
 
-    // 5️⃣ Salva annunci
+    // 5️⃣ Salva annunci + relazione
     for (const item of items) {
       await supabase.from("listings").upsert({
         id: item.id,
@@ -108,12 +125,14 @@ app.post("/search", async (req, res) => {
       results: items.length,
     });
   } catch (err) {
-    console.error("❌ ERRORE SEARCH:", err.message);
+    console.error("❌ ERRORE SEARCH:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// start server
+// ======================
+// Start server
+// ======================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
