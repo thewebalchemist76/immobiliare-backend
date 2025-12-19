@@ -1,3 +1,4 @@
+const axios = require("axios");
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
@@ -15,18 +16,39 @@ app.get("/", (req, res) => {
 
 /**
  * Riceve la ricerca dal frontend
- * (per ora solo log, poi chiamerà Apify)
+ * e lancia l’Actor Apify
  */
 app.post("/search", async (req, res) => {
   const search = req.body;
 
   console.log("🔍 Nuova ricerca ricevuta:", search);
 
-  // STEP SUCCESSIVO (NON ORA):
-  // - chiamare Apify Actor API
-  // - salvare search su Supabase
+  try {
+    const response = await axios.post(
+      `https://api.apify.com/v2/acts/${process.env.APIFY_ACTOR_ID}/runs`,
+      {
+        input: search,
+      },
+      {
+        params: {
+          token: process.env.APIFY_TOKEN,
+        },
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-  res.json({ ok: true });
+    console.log("🚀 Apify run avviato:", response.data.data.id);
+
+    res.json({
+      ok: true,
+      runId: response.data.data.id,
+    });
+  } catch (err) {
+    console.error("❌ Errore Apify:", err.response?.data || err.message);
+    res.status(500).json({ error: "Apify error" });
+  }
 });
 
 // start server
