@@ -8,28 +8,28 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===== Supabase =====
+// ================= SUPABASE =================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ===== Apify =====
+// ================= APIFY =================
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const ACTOR_ID = process.env.APIFY_ACTOR_ID;
 
-// health check
+// ================= HEALTH =================
 app.get("/", (req, res) => {
   res.json({ status: "backend ok" });
 });
 
-// ===== SEARCH =====
+// ================= SEARCH =================
 app.post("/search", async (req, res) => {
   try {
     const input = req.body;
     console.log("🔍 Nuova ricerca ricevuta:", input);
 
-    // normalizza input per Apify
+    // 1️⃣ Normalizza input per Apify
     const actorInput = {
       municipality: input.municipality,
       operation: input.operation || "vendita",
@@ -44,27 +44,28 @@ app.post("/search", async (req, res) => {
       max_items: input.max_items || 1,
     };
 
-    // 1️⃣ Avvia Actor
+    // 2️⃣ Avvia Actor
     const runRes = await axios.post(
       `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
-      actorInput
+      actorInput,
+      { headers: { "Content-Type": "application/json" } }
     );
 
     const runId = runRes.data.data.id;
     console.log("🚀 Run avviato:", runId);
 
-    // 2️⃣ Polling
+    // 3️⃣ Polling stato run
     let status = "RUNNING";
     let runData;
 
     while (status === "RUNNING" || status === "READY") {
       await new Promise((r) => setTimeout(r, 3000));
 
-      const s = await axios.get(
+      const statusRes = await axios.get(
         `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
       );
 
-      runData = s.data.data;
+      runData = statusRes.data.data;
       status = runData.status;
       console.log("⏳ Polling run:", runId, status);
     }
@@ -75,7 +76,7 @@ app.post("/search", async (req, res) => {
 
     console.log("✅ Run completato:", runId);
 
-    // 3️⃣ Dataset
+    // 4️⃣ Leggi dataset
     const datasetId = runData.defaultDatasetId;
     const itemsRes = await axios.get(
       `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
@@ -84,7 +85,7 @@ app.post("/search", async (req, res) => {
     const items = itemsRes.data;
     console.log(`📦 Risultati: ${items.length}`);
 
-    // 4️⃣ Salva ricerca
+    // 5️⃣ Salva ricerca
     const { data: searchRow, error: searchErr } = await supabase
       .from("searches")
       .insert({
@@ -96,23 +97,19 @@ app.post("/search", async (req, res) => {
 
     if (searchErr) throw searchErr;
 
-    // 5️⃣ Salva annunci
+    // 6️⃣ Salva annunci + relazione
     for (const item of items) {
-      const geo = item.raw?.geography || {};
-
-      const listing = {
-        id: item.id,
-        title: item.title,
-        city: geo.municipality?.name ?? null,
-        province: geo.province?.name ?? null,
-        price: item.price?.raw ?? null,
-        url: item.url,
-        raw: item.raw,
-      };
-
       const { error: listingErr } = await supabase
         .from("listings")
-        .upsert(listing);
+        .upsert({
+          id: item.id,
+          title: item.title,
+          city: item.city,
+          province: item.province,
+          price: item.price?.raw ?? null,
+          url: item.url,
+          raw: item.raw,
+        });
 
       if (listingErr) {
         console.error("❌ ERRORE LISTING:", listingErr);
@@ -131,18 +128,20 @@ app.post("/search", async (req, res) => {
       }
     }
 
+    // 7️⃣ Response
     res.json({
       ok: true,
+      searchId: searchRow.id,
       runId,
       results: items.length,
     });
   } catch (err) {
-    console.error("❌ ERRORE SEARCH:", err);
+    console.error("❌ ERRORE SEARCH:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// start server
+// ================= START =================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
