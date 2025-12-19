@@ -3,10 +3,19 @@ const cors = require("cors");
 const axios = require("axios");
 require("dotenv").config();
 
+const { createClient } = require("@supabase/supabase-js");
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ===== Supabase =====
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+// ===== Apify config =====
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const ACTOR_ID = process.env.APIFY_ACTOR_ID;
 
@@ -15,71 +24,97 @@ app.get("/", (req, res) => {
   res.json({ status: "backend ok" });
 });
 
-// avvia ricerca
+// ===== SEARCH ENDPOINT =====
 app.post("/search", async (req, res) => {
   try {
-    const input = req.body;
+    const search = req.body;
+    console.log("🔍 Nuova ricerca ricevuta:", search);
 
-    // 1️⃣ avvia Actor
-    const run = await axios.post(
-      `https://api.apify.com/v2/acts/${ACTOR_ID}/runs`,
-      input,
-      { params: { token: APIFY_TOKEN } }
+    // 1️⃣ Avvia Actor
+    const runRes = await axios.post(
+      `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
+      search
     );
 
-    const runId = run.data.data.id;
+    const runId = runRes.data.data.id;
+    console.log("🚀 Run avviato:", runId);
 
-    // 2️⃣ polling async (NON blocca risposta)
-    pollRun(runId);
+    // 2️⃣ Polling run
+    let runStatus = "RUNNING";
+    let runData;
 
-    res.json({ ok: true, runId });
+    while (runStatus === "RUNNING" || runStatus === "READY") {
+      await new Promise((r) => setTimeout(r, 3000));
+
+      const statusRes = await axios.get(
+        `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
+      );
+
+      runData = statusRes.data.data;
+      runStatus = runData.status;
+
+      console.log("⏳ Polling run:", runId, runStatus);
+    }
+
+    if (runStatus !== "SUCCEEDED") {
+      throw new Error(`Run fallito: ${runStatus}`);
+    }
+
+    console.log("✅ Run completato:", runId);
+
+    // 3️⃣ Leggi dataset risultati
+    const datasetId = runData.defaultDatasetId;
+
+    const itemsRes = await axios.get(
+      `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
+    );
+
+    const items = itemsRes.data;
+    console.log(`📦 Risultati: ${items.length}`);
+
+    // 4️⃣ Salva ricerca
+    const { data: searchRow, error: searchError } = await supabase
+      .from("searches")
+      .insert({
+        query: search,
+        run_id: runId,
+      })
+      .select()
+      .single();
+
+    if (searchError) throw searchError;
+
+    // 5️⃣ Salva annunci
+    for (const item of items) {
+      await supabase.from("listings").upsert({
+        id: item.id,
+        title: item.title,
+        city: item.city,
+        province: item.province,
+        price: item.price?.raw ?? null,
+        url: item.url,
+        raw: item.raw,
+      });
+
+      await supabase.from("search_results").insert({
+        search_id: searchRow.id,
+        listing_id: item.id,
+      });
+    }
+
+    res.json({
+      ok: true,
+      runId,
+      results: items.length,
+    });
   } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({ error: "Errore avvio actor" });
+    console.error("❌ ERRORE SEARCH:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// polling
-async function pollRun(runId) {
-  console.log("⏳ Polling run:", runId);
-
-  const interval = setInterval(async () => {
-    try {
-      const r = await axios.get(
-        `https://api.apify.com/v2/actor-runs/${runId}`,
-        { params: { token: APIFY_TOKEN } }
-      );
-
-      const run = r.data.data;
-
-      if (run.status === "SUCCEEDED") {
-        clearInterval(interval);
-
-        console.log("✅ Run completato:", runId);
-
-        // 3️⃣ fetch risultati
-        const items = await axios.get(
-          `https://api.apify.com/v2/datasets/${run.defaultDatasetId}/items`,
-          { params: { token: APIFY_TOKEN } }
-        );
-
-        console.log("📦 Risultati:", items.data.length);
-
-        // STEP SUCCESSIVO:
-        // salvare items.data su Supabase
-      }
-
-      if (run.status === "FAILED") {
-        clearInterval(interval);
-        console.error("❌ Run fallito:", runId);
-      }
-    } catch (e) {
-      console.error("Errore polling:", e.message);
-    }
-  }, 5000); // ogni 5 secondi
-}
-
+// start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`Backend running on port ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`);
+});
