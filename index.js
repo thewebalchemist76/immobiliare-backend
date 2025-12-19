@@ -89,6 +89,7 @@ app.post("/search", async (req, res) => {
     const { data: searchRow, error: searchErr } = await supabase
       .from("searches")
       .insert({
+        user_id: input.user_id,
         query: actorInput,
         run_id: runId,
       })
