@@ -31,13 +31,31 @@ app.post("/search", async (req, res) => {
     console.log("🔍 Nuova ricerca ricevuta:", search);
 
     // INPUT CONFORME A INPUT_SCHEMA
+    //const actorInput = {
+    //  municipality: search.municipality,
+    //  operation: search.operation || "vendita",
+    //  min_price: search.min_price ?? null,
+    //  max_price: search.max_price ?? null,
+    //  max_items: search.max_items ?? 1,
+    //};
+
+
+
     const actorInput = {
       municipality: search.municipality,
       operation: search.operation || "vendita",
-      min_price: search.min_price ?? null,
-      max_price: search.max_price ?? null,
       max_items: search.max_items ?? 1,
     };
+
+    if (Number.isInteger(search.min_price)) {
+      actorInput.min_price = search.min_price;
+    }
+
+    if (Number.isInteger(search.max_price)) {
+      actorInput.max_price = search.max_price;
+    }
+
+
 
     // 1️⃣ Avvia Actor
     const runRes = await axios.post(
