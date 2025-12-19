@@ -27,10 +27,9 @@ app.get("/", (req, res) => {
 app.post("/search", async (req, res) => {
   try {
     const input = req.body;
-
     console.log("🔍 Nuova ricerca ricevuta:", input);
 
-    // --- normalizza input per Apify ---
+    // normalizza input per Apify
     const actorInput = {
       municipality: input.municipality,
       operation: input.operation || "vendita",
@@ -99,17 +98,21 @@ app.post("/search", async (req, res) => {
 
     // 5️⃣ Salva annunci
     for (const item of items) {
+      const geo = item.raw?.geography || {};
+
+      const listing = {
+        id: item.id,
+        title: item.title,
+        city: geo.municipality?.name ?? null,
+        province: geo.province?.name ?? null,
+        price: item.price?.raw ?? null,
+        url: item.url,
+        raw: item.raw,
+      };
+
       const { error: listingErr } = await supabase
         .from("listings")
-        .upsert({
-          id: item.id,
-          title: item.title,
-          city: item.city,
-          province: item.province,
-          price: item.price?.raw ?? null,
-          url: item.url,
-          raw: item.raw,
-        });
+        .upsert(listing);
 
       if (listingErr) {
         console.error("❌ ERRORE LISTING:", listingErr);
