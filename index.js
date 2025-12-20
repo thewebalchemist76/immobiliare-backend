@@ -27,9 +27,8 @@ app.get("/", (req, res) => {
 app.post("/search", async (req, res) => {
   try {
     const input = req.body;
-    console.log("🔍 Nuova ricerca ricevuta:", input);
+    console.log("➡️ /search chiamata", input);
 
-    // 1️⃣ INPUT = PASS-THROUGH verso Apify
     const actorInput = {
       location_query: input.location_query ?? null,
       location_id: input.location_id ?? null,
@@ -55,12 +54,13 @@ app.post("/search", async (req, res) => {
       max_items: input.max_items || 1,
     };
 
-    // sicurezza minima
     if (!actorInput.location_query && !actorInput.location_id) {
-      throw new Error("location_query o location_id obbligatorio");
+      return res.status(400).json({ error: "location_query obbligatorio" });
     }
 
-    // 2️⃣ Avvia Actor
+    console.log("➡️ Avvio Apify", actorInput);
+
+    // 🔥 AVVIO RUN (NON BLOCCANTE)
     const runRes = await axios.post(
       `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
       actorInput,
@@ -70,87 +70,25 @@ app.post("/search", async (req, res) => {
     const runId = runRes.data.data.id;
     console.log("🚀 Run avviato:", runId);
 
-    // 3️⃣ Polling run
-    let status = "RUNNING";
-    let runData;
-
-    while (status === "RUNNING" || status === "READY") {
-      await new Promise((r) => setTimeout(r, 3000));
-
-      const statusRes = await axios.get(
-        `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
-      );
-
-      runData = statusRes.data.data;
-      status = runData.status;
-      console.log("⏳ Polling run:", runId, status);
-    }
-
-    if (status !== "SUCCEEDED") {
-      throw new Error(`Run fallito: ${status}`);
-    }
-
-    console.log("✅ Run completato:", runId);
-
-    // 4️⃣ Leggi dataset
-    const datasetId = runData.defaultDatasetId;
-    const itemsRes = await axios.get(
-      `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
-    );
-
-    const items = itemsRes.data;
-    console.log(`📦 Risultati: ${items.length}`);
-
-    // 5️⃣ Salva ricerca
-    const { data: searchRow, error: searchErr } = await supabase
+    // salva la search SUBITO
+    const { data: searchRow, error } = await supabase
       .from("searches")
       .insert({
         user_id: input.user_id,
         query: actorInput,
         run_id: runId,
+        status: "running",
       })
       .select()
       .single();
 
-    if (searchErr) throw searchErr;
+    if (error) throw error;
 
-    // 6️⃣ Salva annunci + relazione
-    for (const item of items) {
-      const { error: listingErr } = await supabase
-        .from("listings")
-        .upsert({
-          id: item.id,
-          title: item.title,
-          city: item.city,
-          province: item.province,
-          price: item.price?.raw ?? null,
-          url: item.url,
-          raw: item.raw,
-        });
-
-      if (listingErr) {
-        console.error("❌ ERRORE LISTING:", listingErr);
-        continue;
-      }
-
-      const { error: relErr } = await supabase
-        .from("search_results")
-        .insert({
-          search_id: searchRow.id,
-          listing_id: item.id,
-        });
-
-      if (relErr) {
-        console.error("❌ ERRORE SEARCH_RESULTS:", relErr);
-      }
-    }
-
-    // 7️⃣ Response
+    // ✅ RESPONSE IMMEDIATA
     res.json({
       ok: true,
       searchId: searchRow.id,
       runId,
-      results: items.length,
     });
   } catch (err) {
     console.error("❌ ERRORE SEARCH:", err.message);
