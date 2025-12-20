@@ -29,20 +29,36 @@ app.post("/search", async (req, res) => {
     const input = req.body;
     console.log("🔍 Nuova ricerca ricevuta:", input);
 
-    // 1️⃣ Normalizza input per Apify
+    // 1️⃣ INPUT = PASS-THROUGH verso Apify
     const actorInput = {
-      municipality: input.municipality,
+      location_query: input.location_query ?? null,
+      location_id: input.location_id ?? null,
       operation: input.operation || "vendita",
-      min_price:
-        input.min_price === null || input.min_price === undefined
-          ? 0
-          : Number(input.min_price),
-      max_price:
-        input.max_price === null || input.max_price === undefined
-          ? 999999999
-          : Number(input.max_price),
+
+      min_price: input.min_price ?? null,
+      max_price: input.max_price ?? null,
+
+      min_rooms: input.min_rooms ?? null,
+      max_rooms: input.max_rooms ?? null,
+
+      min_size: input.min_size ?? null,
+      max_size: input.max_size ?? null,
+
+      garden: input.garden ?? "Indifferente",
+      terrace: !!input.terrace,
+      balcony: !!input.balcony,
+      lift: !!input.lift,
+      furnished: !!input.furnished,
+      pool: !!input.pool,
+      exclude_auctions: !!input.exclude_auctions,
+
       max_items: input.max_items || 1,
     };
+
+    // sicurezza minima
+    if (!actorInput.location_query && !actorInput.location_id) {
+      throw new Error("location_query o location_id obbligatorio");
+    }
 
     // 2️⃣ Avvia Actor
     const runRes = await axios.post(
@@ -54,7 +70,7 @@ app.post("/search", async (req, res) => {
     const runId = runRes.data.data.id;
     console.log("🚀 Run avviato:", runId);
 
-    // 3️⃣ Polling stato run
+    // 3️⃣ Polling run
     let status = "RUNNING";
     let runData;
 
