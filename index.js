@@ -19,7 +19,7 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const ACTOR_ID = process.env.APIFY_ACTOR_ID;
 
 // ================= HEALTH =================
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.json({ status: "backend ok" });
 });
 
@@ -29,7 +29,7 @@ app.post("/search", async (req, res) => {
     const input = req.body;
     console.log("➡️ /search chiamata", input);
 
-    // ✅ INPUT SENZA CAMPI NULL
+    // ✅ costruzione input Apify SENZA null
     const actorInput = {
       ...(input.location_query && { location_query: input.location_query }),
       ...(input.location_id && { location_id: input.location_id }),
@@ -64,7 +64,7 @@ app.post("/search", async (req, res) => {
 
     console.log("➡️ Avvio Apify", actorInput);
 
-    // 🚀 AVVIO RUN (NON BLOCCANTE)
+    // 🚀 avvio run Apify (NON BLOCCANTE)
     const runRes = await axios.post(
       `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
       actorInput,
@@ -74,7 +74,7 @@ app.post("/search", async (req, res) => {
     const runId = runRes.data.data.id;
     console.log("🚀 Run avviato:", runId);
 
-    // ✅ salva la search (SENZA status)
+    // salva la search
     const { data: searchRow, error } = await supabase
       .from("searches")
       .insert({
@@ -87,7 +87,7 @@ app.post("/search", async (req, res) => {
 
     if (error) throw error;
 
-    // ✅ RESPONSE IMMEDIATA
+    // risposta immediata al frontend
     res.json({
       ok: true,
       searchId: searchRow.id,
@@ -95,6 +95,70 @@ app.post("/search", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ ERRORE SEARCH:", err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================= APIFY WEBHOOK =================
+app.post("/apify-webhook", async (req, res) => {
+  try {
+    const runId = req.body?.resource?.id;
+
+    if (!runId) {
+      return res.status(400).json({ error: "runId mancante" });
+    }
+
+    console.log("🔔 Webhook Apify ricevuto per run:", runId);
+
+    // 1️⃣ trova search collegata
+    const { data: searchRow, error: searchErr } = await supabase
+      .from("searches")
+      .select("*")
+      .eq("run_id", runId)
+      .single();
+
+    if (searchErr || !searchRow) {
+      console.error("❌ Search non trovata per run:", runId);
+      return res.status(404).json({ error: "search non trovata" });
+    }
+
+    // 2️⃣ recupera dataset
+    const runRes = await axios.get(
+      `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
+    );
+
+    const datasetId = runRes.data.data.defaultDatasetId;
+
+    const itemsRes = await axios.get(
+      `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
+    );
+
+    const items = itemsRes.data;
+    console.log(`📦 ${items.length} risultati da Apify`);
+
+    // 3️⃣ salva risultati
+    for (const item of items) {
+      await supabase.from("listings").upsert({
+        id: item.id,
+        title: item.title,
+        city: item.city,
+        province: item.province,
+        price: item.price?.raw ?? null,
+        url: item.url,
+        raw: item.raw,
+      });
+
+      await supabase.from("search_results").insert({
+        search_id: searchRow.id,
+        listing_id: item.id,
+      });
+    }
+
+    console.log("✅ Risultati salvati per search:", searchRow.id);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ ERRORE WEBHOOK:", err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
 });
