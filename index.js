@@ -29,38 +29,43 @@ app.post("/search", async (req, res) => {
     const input = req.body;
     console.log("➡️ /search chiamata", input);
 
+    // ✅ COSTRUZIONE INPUT SENZA NULL
     const actorInput = {
-      location_query: input.location_query ?? null,
-      location_id: input.location_id ?? null,
+      ...(input.location_query && { location_query: input.location_query }),
+      ...(input.location_id && { location_id: input.location_id }),
+
       operation: input.operation || "vendita",
 
-      min_price: input.min_price ?? null,
-      max_price: input.max_price ?? null,
+      ...(input.min_price != null && { min_price: input.min_price }),
+      ...(input.max_price != null && { max_price: input.max_price }),
 
-      min_rooms: input.min_rooms ?? null,
-      max_rooms: input.max_rooms ?? null,
+      ...(input.min_rooms != null && { min_rooms: input.min_rooms }),
+      ...(input.max_rooms != null && { max_rooms: input.max_rooms }),
 
-      min_size: input.min_size ?? null,
-      max_size: input.max_size ?? null,
+      ...(input.min_size != null && { min_size: input.min_size }),
+      ...(input.max_size != null && { max_size: input.max_size }),
 
-      garden: input.garden ?? "Indifferente",
-      terrace: !!input.terrace,
-      balcony: !!input.balcony,
-      lift: !!input.lift,
-      furnished: !!input.furnished,
-      pool: !!input.pool,
-      exclude_auctions: !!input.exclude_auctions,
+      ...(input.garden && { garden: input.garden }),
+      ...(input.terrace && { terrace: true }),
+      ...(input.balcony && { balcony: true }),
+      ...(input.lift && { lift: true }),
+      ...(input.furnished && { furnished: true }),
+      ...(input.pool && { pool: true }),
+      ...(input.exclude_auctions && { exclude_auctions: true }),
 
       max_items: input.max_items || 1,
     };
 
+    // sicurezza minima
     if (!actorInput.location_query && !actorInput.location_id) {
-      return res.status(400).json({ error: "location_query obbligatorio" });
+      return res.status(400).json({
+        error: "location_query o location_id obbligatorio",
+      });
     }
 
     console.log("➡️ Avvio Apify", actorInput);
 
-    // 🔥 AVVIO RUN (NON BLOCCANTE)
+    // 🚀 AVVIO RUN (NON BLOCCANTE)
     const runRes = await axios.post(
       `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
       actorInput,
@@ -91,7 +96,7 @@ app.post("/search", async (req, res) => {
       runId,
     });
   } catch (err) {
-    console.error("❌ ERRORE SEARCH:", err.message);
+    console.error("❌ ERRORE SEARCH:", err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
 });
