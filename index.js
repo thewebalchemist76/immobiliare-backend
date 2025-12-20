@@ -29,7 +29,7 @@ app.post("/search", async (req, res) => {
     const input = req.body;
     console.log("➡️ /search chiamata", input);
 
-    // ✅ COSTRUZIONE INPUT SENZA NULL
+    // ✅ INPUT SENZA CAMPI NULL
     const actorInput = {
       ...(input.location_query && { location_query: input.location_query }),
       ...(input.location_id && { location_id: input.location_id }),
@@ -56,7 +56,6 @@ app.post("/search", async (req, res) => {
       max_items: input.max_items || 1,
     };
 
-    // sicurezza minima
     if (!actorInput.location_query && !actorInput.location_id) {
       return res.status(400).json({
         error: "location_query o location_id obbligatorio",
@@ -75,14 +74,13 @@ app.post("/search", async (req, res) => {
     const runId = runRes.data.data.id;
     console.log("🚀 Run avviato:", runId);
 
-    // salva la search SUBITO
+    // ✅ salva la search (SENZA status)
     const { data: searchRow, error } = await supabase
       .from("searches")
       .insert({
         user_id: input.user_id,
         query: actorInput,
         run_id: runId,
-        status: "running",
       })
       .select()
       .single();
