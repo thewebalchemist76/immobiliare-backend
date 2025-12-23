@@ -23,48 +23,64 @@ app.get("/", (_req, res) => {
   res.json({ status: "backend ok" });
 });
 
-// ================= SEARCH =================
-app.post("/search", async (req, res) => {
+
+// ======================================================
+// 🔹 GET AGENCY (una per utente)
+// ======================================================
+app.get("/agency/me", async (req, res) => {
+  const userId = req.query.user_id;
+
+  if (!userId) {
+    return res.status(400).json({ error: "user_id mancante" });
+  }
+
+  const { data, error } = await supabase
+    .from("agencies")
+    .select("*")
+    .eq("user_id", userId)
+    .single();
+
+  if (error) {
+    return res.status(404).json({ error: "agenzia non trovata" });
+  }
+
+  res.json(data);
+});
+
+
+// ======================================================
+// 🔹 START DAILY CHECK (vendita, zona fissa)
+// ======================================================
+app.post("/run-agency", async (req, res) => {
   try {
-    const input = req.body;
-    console.log("➡️ /search chiamata", input);
+    const { agency_id } = req.body;
 
-    // ✅ costruzione input Apify SENZA null
-    const actorInput = {
-      ...(input.location_query && { location_query: input.location_query }),
-      ...(input.location_id && { location_id: input.location_id }),
-
-      operation: input.operation || "vendita",
-
-      ...(input.min_price != null && { min_price: input.min_price }),
-      ...(input.max_price != null && { max_price: input.max_price }),
-
-      ...(input.min_rooms != null && { min_rooms: input.min_rooms }),
-      ...(input.max_rooms != null && { max_rooms: input.max_rooms }),
-
-      ...(input.min_size != null && { min_size: input.min_size }),
-      ...(input.max_size != null && { max_size: input.max_size }),
-
-      ...(input.garden && { garden: input.garden }),
-      ...(input.terrace && { terrace: true }),
-      ...(input.balcony && { balcony: true }),
-      ...(input.lift && { lift: true }),
-      ...(input.furnished && { furnished: true }),
-      ...(input.pool && { pool: true }),
-      ...(input.exclude_auctions && { exclude_auctions: true }),
-
-      max_items: input.max_items || 1,
-    };
-
-    if (!actorInput.location_query && !actorInput.location_id) {
-      return res.status(400).json({
-        error: "location_query o location_id obbligatorio",
-      });
+    if (!agency_id) {
+      return res.status(400).json({ error: "agency_id mancante" });
     }
 
-    console.log("➡️ Avvio Apify", actorInput);
+    // 1️⃣ carica agenzia
+    const { data: agency, error } = await supabase
+      .from("agencies")
+      .select("*")
+      .eq("id", agency_id)
+      .single();
 
-    // 🚀 avvio run Apify (NON BLOCCANTE)
+    if (error || !agency) {
+      return res.status(404).json({ error: "agenzia non trovata" });
+    }
+
+    // 2️⃣ input Apify (solo vendita)
+    const actorInput = {
+      points: agency.points,
+      operation: "vendita",
+      ...agency.filters,
+      max_items: 2
+    };
+
+    console.log("🚀 Avvio Apify per agency", agency.id, actorInput);
+
+    // 3️⃣ avvia run Apify
     const runRes = await axios.post(
       `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
       actorInput,
@@ -72,72 +88,67 @@ app.post("/search", async (req, res) => {
     );
 
     const runId = runRes.data.data.id;
-    console.log("🚀 Run avviato:", runId);
 
-    // salva la search
-    const { data: searchRow, error } = await supabase
-      .from("searches")
-      .insert({
-        user_id: input.user_id,
-        query: actorInput,
-        run_id: runId,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    // risposta immediata al frontend
-    res.json({
-      ok: true,
-      searchId: searchRow.id,
-      runId,
+    // 4️⃣ crea run giornaliera (vuota, verrà aggiornata dal webhook)
+    await supabase.from("agency_runs").upsert({
+      agency_id: agency.id,
+      run_date: new Date().toISOString().slice(0, 10),
+      total_listings: 0,
+      new_listings: 0
     });
+
+    res.json({ ok: true, runId });
   } catch (err) {
-    console.error("❌ ERRORE SEARCH:", err.response?.data || err.message);
+    console.error("❌ ERRORE RUN AGENCY:", err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ================= APIFY WEBHOOK =================
+
+// ======================================================
+// 🔔 APIFY WEBHOOK (CUORE LOGICA NUOVI ANNUNCI)
+// ======================================================
 app.post("/apify-webhook", async (req, res) => {
   try {
     const runId = req.body?.resource?.id;
-
     if (!runId) {
       return res.status(400).json({ error: "runId mancante" });
     }
 
-    console.log("🔔 Webhook Apify ricevuto per run:", runId);
+    console.log("🔔 Webhook ricevuto per run:", runId);
 
-    // 1️⃣ trova search collegata
-    const { data: searchRow, error: searchErr } = await supabase
-      .from("searches")
-      .select("*")
-      .eq("run_id", runId)
-      .single();
-
-    if (searchErr || !searchRow) {
-      console.error("❌ Search non trovata per run:", runId);
-      return res.status(404).json({ error: "search non trovata" });
-    }
-
-    // 2️⃣ recupera dataset
+    // 1️⃣ recupera run Apify
     const runRes = await axios.get(
       `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
     );
 
-    const datasetId = runRes.data.data.defaultDatasetId;
+    const runData = runRes.data.data;
+    const datasetId = runData.defaultDatasetId;
+    const actorInput = runData.options?.input || {};
 
+    // 2️⃣ trova agenzia tramite points
+    const { data: agency, error: agencyErr } = await supabase
+      .from("agencies")
+      .select("*")
+      .eq("points", actorInput.points)
+      .single();
+
+    if (agencyErr || !agency) {
+      console.error("❌ Agenzia non trovata per run", runId);
+      return res.status(404).json({ error: "agenzia non trovata" });
+    }
+
+    // 3️⃣ scarica dataset
     const itemsRes = await axios.get(
       `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
     );
 
     const items = itemsRes.data;
-    console.log(`📦 ${items.length} risultati da Apify`);
+    let newCount = 0;
 
-    // 3️⃣ salva risultati
+    // 4️⃣ processa annunci
     for (const item of items) {
+      // UPSERT listings
       await supabase.from("listings").upsert({
         id: item.id,
         title: item.title,
@@ -145,16 +156,35 @@ app.post("/apify-webhook", async (req, res) => {
         province: item.province,
         price: item.price?.raw ?? null,
         url: item.url,
-        raw: item.raw,
+        raw: item.raw
       });
 
-      await supabase.from("search_results").insert({
-        search_id: searchRow.id,
-        listing_id: item.id,
-      });
+      // collega a agenzia (NUOVO se non esiste)
+      const { error: linkErr } = await supabase
+        .from("agency_listings")
+        .insert({
+          agency_id: agency.id,
+          listing_id: item.id
+        });
+
+      if (!linkErr) {
+        newCount++;
+      }
     }
 
-    console.log("✅ Risultati salvati per search:", searchRow.id);
+    // 5️⃣ aggiorna run giornaliera
+    await supabase
+      .from("agency_runs")
+      .update({
+        total_listings: items.length,
+        new_listings: newCount
+      })
+      .eq("agency_id", agency.id)
+      .eq("run_date", new Date().toISOString().slice(0, 10));
+
+    console.log(
+      `✅ Agency ${agency.id} – ${newCount} nuovi annunci su ${items.length}`
+    );
 
     res.json({ ok: true });
   } catch (err) {
@@ -162,6 +192,7 @@ app.post("/apify-webhook", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ================= START =================
 const PORT = process.env.PORT || 3000;
