@@ -23,7 +23,6 @@ app.get("/", (_req, res) => {
   res.json({ status: "backend ok" });
 });
 
-
 // ======================================================
 // 🔹 GET AGENCY (una per utente)
 // ======================================================
@@ -40,13 +39,12 @@ app.get("/agency/me", async (req, res) => {
     .eq("user_id", userId)
     .single();
 
-  if (error) {
+  if (error || !data) {
     return res.status(404).json({ error: "agenzia non trovata" });
   }
 
   res.json(data);
 });
-
 
 // ======================================================
 // 🔹 START DAILY CHECK (vendita, zona fissa)
@@ -74,8 +72,8 @@ app.post("/run-agency", async (req, res) => {
     const actorInput = {
       points: agency.points,
       operation: "vendita",
-      ...agency.filters,
-      max_items: 2
+      ...(agency.filters || {}),
+      max_items: 2,
     };
 
     console.log("🚀 Avvio Apify per agency", agency.id, actorInput);
@@ -89,12 +87,12 @@ app.post("/run-agency", async (req, res) => {
 
     const runId = runRes.data.data.id;
 
-    // 4️⃣ crea run giornaliera (vuota, verrà aggiornata dal webhook)
-    await supabase.from("agency_runs").upsert({
+    // 4️⃣ salva agency_run (colleghiamo il run!)
+    await supabase.from("agency_runs").insert({
       agency_id: agency.id,
+      apify_run_id: runId,
       run_date: new Date().toISOString().slice(0, 10),
-      total_listings: 0,
-      new_listings: 0
+      new_listings_count: 0,
     });
 
     res.json({ ok: true, runId });
@@ -103,7 +101,6 @@ app.post("/run-agency", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 // ================= APIFY WEBHOOK =================
 app.post("/apify-webhook", async (req, res) => {
@@ -147,7 +144,7 @@ app.post("/apify-webhook", async (req, res) => {
 
     // 3️⃣ processa annunci
     for (const item of items) {
-      // salva / aggiorna listing globale
+      // salva listing globale
       await supabase.from("listings").upsert({
         id: item.id,
         title: item.title,
@@ -167,7 +164,6 @@ app.post("/apify-webhook", async (req, res) => {
         .maybeSingle();
 
       if (!existing) {
-        // ➕ nuovo annuncio per l’agenzia
         await supabase.from("agency_listings").insert({
           agency_id: agencyId,
           listing_id: item.id,
@@ -190,63 +186,6 @@ app.post("/apify-webhook", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-
-    // 3️⃣ scarica dataset
-    const itemsRes = await axios.get(
-      `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
-    );
-
-    const items = itemsRes.data;
-    let newCount = 0;
-
-    // 4️⃣ processa annunci
-    for (const item of items) {
-      // UPSERT listings
-      await supabase.from("listings").upsert({
-        id: item.id,
-        title: item.title,
-        city: item.city,
-        province: item.province,
-        price: item.price?.raw ?? null,
-        url: item.url,
-        raw: item.raw
-      });
-
-      // collega a agenzia (NUOVO se non esiste)
-      const { error: linkErr } = await supabase
-        .from("agency_listings")
-        .insert({
-          agency_id: agency.id,
-          listing_id: item.id
-        });
-
-      if (!linkErr) {
-        newCount++;
-      }
-    }
-
-    // 5️⃣ aggiorna run giornaliera
-    await supabase
-      .from("agency_runs")
-      .update({
-        total_listings: items.length,
-        new_listings: newCount
-      })
-      .eq("agency_id", agency.id)
-      .eq("run_date", new Date().toISOString().slice(0, 10));
-
-    console.log(
-      `✅ Agency ${agency.id} – ${newCount} nuovi annunci su ${items.length}`
-    );
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("❌ ERRORE WEBHOOK:", err.response?.data || err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 
 // ================= START =================
 const PORT = process.env.PORT || 3000;
