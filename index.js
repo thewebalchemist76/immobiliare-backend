@@ -27,42 +27,34 @@ app.get("/", (_req, res) => {
 // 🔹 GET AGENCY (una per utente)
 // ======================================================
 app.get("/agency/me", async (req, res) => {
-  try {
-    const userId = req.query.user_id;
-
-    if (!userId) {
-      return res.status(400).json({ error: "user_id mancante" });
-    }
-
-    const { data, error } = await supabase
-      .from("agencies")
-      .select("*")
-      .eq("user_id", userId)
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: "agenzia non trovata" });
-    }
-
-    res.json(data);
-  } catch (err) {
-    console.error("❌ ERRORE GET AGENCY:", err.message);
-    res.status(500).json({ error: err.message });
+  const userId = req.query.user_id;
+  if (!userId) {
+    return res.status(400).json({ error: "user_id mancante" });
   }
+
+  const { data, error } = await supabase
+    .from("agencies")
+    .select("*")
+    .eq("user_id", userId)
+    .single();
+
+  if (error || !data) {
+    return res.status(404).json({ error: "agenzia non trovata" });
+  }
+
+  res.json(data);
 });
 
 // ======================================================
-// 🔹 START DAILY CHECK (vendita, zona fissa)
+// 🔹 START AGENCY RUN
 // ======================================================
 app.post("/run-agency", async (req, res) => {
   try {
     const { agency_id } = req.body;
-
     if (!agency_id) {
       return res.status(400).json({ error: "agency_id mancante" });
     }
 
-    // 1️⃣ carica agenzia
     const { data: agency, error } = await supabase
       .from("agencies")
       .select("*")
@@ -73,20 +65,6 @@ app.post("/run-agency", async (req, res) => {
       return res.status(404).json({ error: "agenzia non trovata" });
     }
 
-    // 2️⃣ CREA agency_run SUBITO (evita race condition)
-    const { data: agencyRun, error: runErr } = await supabase
-      .from("agency_runs")
-      .insert({
-        agency_id: agency.id,
-        run_date: new Date().toISOString().slice(0, 10),
-        new_listings_count: 0,
-      })
-      .select()
-      .single();
-
-    if (runErr) throw runErr;
-
-    // 3️⃣ input Apify (solo vendita)
     const actorInput = {
       points: agency.points,
       operation: "vendita",
@@ -96,7 +74,6 @@ app.post("/run-agency", async (req, res) => {
 
     console.log("🚀 Avvio Apify per agency", agency.id, actorInput);
 
-    // 4️⃣ avvia run Apify
     const runRes = await axios.post(
       `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
       actorInput,
@@ -105,15 +82,16 @@ app.post("/run-agency", async (req, res) => {
 
     const runId = runRes.data.data.id;
 
-    // 5️⃣ collega agency_run al run Apify
-    await supabase
-      .from("agency_runs")
-      .update({ apify_run_id: runId })
-      .eq("id", agencyRun.id);
+    await supabase.from("agency_runs").insert({
+      agency_id: agency.id,
+      apify_run_id: runId,
+      run_started_at: new Date().toISOString(),
+      new_listings_count: 0,
+    });
 
     res.json({ ok: true, runId });
   } catch (err) {
-    console.error("❌ ERRORE RUN AGENCY:", err.response?.data || err.message);
+    console.error("❌ ERRORE RUN AGENCY:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -124,28 +102,29 @@ app.post("/run-agency", async (req, res) => {
 app.post("/apify-webhook", async (req, res) => {
   try {
     const runId = req.body?.resource?.id;
-
     if (!runId) {
       return res.status(400).json({ error: "runId mancante" });
     }
 
     console.log("🔔 Webhook Apify ricevuto per run:", runId);
 
-    // 1️⃣ trova agency_run
-    const { data: agencyRun, error: runErr } = await supabase
+    // 1️⃣ recupera agency_run (se esiste)
+    const { data: agencyRun } = await supabase
       .from("agency_runs")
       .select("*")
       .eq("apify_run_id", runId)
-      .single();
+      .maybeSingle();
 
-    if (runErr || !agencyRun) {
-      console.error("❌ agency_run non trovato per run:", runId);
-      return res.status(404).json({ error: "agency_run non trovato" });
+    if (!agencyRun) {
+      console.warn("⚠️ agency_run non trovato, continuo comunque");
     }
 
-    const agencyId = agencyRun.agency_id;
+    const agencyId = agencyRun?.agency_id;
+    if (!agencyId) {
+      return res.status(200).json({ ok: true, skipped: true });
+    }
 
-    // 2️⃣ recupera dataset Apify
+    // 2️⃣ dataset Apify
     const runRes = await axios.get(
       `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
     );
@@ -156,14 +135,14 @@ app.post("/apify-webhook", async (req, res) => {
       `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
     );
 
-    const items = itemsRes.data || [];
+    const items = itemsRes.data;
     console.log(`📦 ${items.length} annunci ricevuti`);
 
     let newCount = 0;
 
-    // 3️⃣ processa annunci
+    // 3️⃣ salva annunci + collega all’agenzia
     for (const item of items) {
-      // salva listing globale
+      // listings globali
       await supabase.from("listings").upsert({
         id: item.id,
         title: item.title,
@@ -172,36 +151,35 @@ app.post("/apify-webhook", async (req, res) => {
         price: item.price?.raw ?? null,
         url: item.url,
         raw: item.raw,
+        first_seen_at: new Date().toISOString(),
       });
 
-      // collega a agenzia se nuovo
-      const { data: existing } = await supabase
+      // relazione agency_listings
+      const { error: linkErr } = await supabase
         .from("agency_listings")
-        .select("listing_id")
-        .eq("agency_id", agencyId)
-        .eq("listing_id", item.id)
-        .maybeSingle();
-
-      if (!existing) {
-        await supabase.from("agency_listings").insert({
+        .insert({
           agency_id: agencyId,
           listing_id: item.id,
         });
+
+      if (!linkErr) {
         newCount++;
       }
     }
 
-    // 4️⃣ aggiorna contatore nuovi annunci
-    await supabase
-      .from("agency_runs")
-      .update({ new_listings_count: newCount })
-      .eq("id", agencyRun.id);
+    // 4️⃣ aggiorna contatore run
+    if (agencyRun) {
+      await supabase
+        .from("agency_runs")
+        .update({ new_listings_count: newCount })
+        .eq("id", agencyRun.id);
+    }
 
-    console.log(`✅ Agency run ${agencyRun.id}: ${newCount} annunci nuovi`);
+    console.log(`✅ ${newCount} annunci nuovi collegati all’agenzia`);
 
     res.json({ ok: true, new_listings_count: newCount });
   } catch (err) {
-    console.error("❌ ERRORE WEBHOOK:", err.response?.data || err.message);
+    console.error("❌ ERRORE WEBHOOK:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
