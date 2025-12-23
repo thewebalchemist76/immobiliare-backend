@@ -73,7 +73,20 @@ app.post("/run-agency", async (req, res) => {
       return res.status(404).json({ error: "agenzia non trovata" });
     }
 
-    // 2️⃣ input Apify (solo vendita)
+    // 2️⃣ CREA agency_run SUBITO (evita race condition)
+    const { data: agencyRun, error: runErr } = await supabase
+      .from("agency_runs")
+      .insert({
+        agency_id: agency.id,
+        run_date: new Date().toISOString().slice(0, 10),
+        new_listings_count: 0,
+      })
+      .select()
+      .single();
+
+    if (runErr) throw runErr;
+
+    // 3️⃣ input Apify (solo vendita)
     const actorInput = {
       points: agency.points,
       operation: "vendita",
@@ -83,7 +96,7 @@ app.post("/run-agency", async (req, res) => {
 
     console.log("🚀 Avvio Apify per agency", agency.id, actorInput);
 
-    // 3️⃣ avvia run Apify
+    // 4️⃣ avvia run Apify
     const runRes = await axios.post(
       `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
       actorInput,
@@ -92,13 +105,11 @@ app.post("/run-agency", async (req, res) => {
 
     const runId = runRes.data.data.id;
 
-    // 4️⃣ salva agency_run COLLEGATO AL RUN APIFY
-    await supabase.from("agency_runs").insert({
-      agency_id: agency.id,
-      apify_run_id: runId,
-      run_date: new Date().toISOString().slice(0, 10),
-      new_listings_count: 0,
-    });
+    // 5️⃣ collega agency_run al run Apify
+    await supabase
+      .from("agency_runs")
+      .update({ apify_run_id: runId })
+      .eq("id", agencyRun.id);
 
     res.json({ ok: true, runId });
   } catch (err) {
@@ -120,7 +131,7 @@ app.post("/apify-webhook", async (req, res) => {
 
     console.log("🔔 Webhook Apify ricevuto per run:", runId);
 
-    // 1️⃣ trova agency_run collegata
+    // 1️⃣ trova agency_run
     const { data: agencyRun, error: runErr } = await supabase
       .from("agency_runs")
       .select("*")
@@ -152,7 +163,7 @@ app.post("/apify-webhook", async (req, res) => {
 
     // 3️⃣ processa annunci
     for (const item of items) {
-      // salva / aggiorna listing globale
+      // salva listing globale
       await supabase.from("listings").upsert({
         id: item.id,
         title: item.title,
@@ -163,7 +174,7 @@ app.post("/apify-webhook", async (req, res) => {
         raw: item.raw,
       });
 
-      // verifica se già associato all'agenzia
+      // collega a agenzia se nuovo
       const { data: existing } = await supabase
         .from("agency_listings")
         .select("listing_id")
