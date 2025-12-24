@@ -57,13 +57,12 @@ app.post("/run-agency", async (req, res) => {
 
     const runId = runRes.data.data.id;
 
-    // 🔑 salva il run ID sull'agenzia (CHIAVE)
+    // 🔑 collega run → agenzia
     await supabase
       .from("agencies")
       .update({ last_apify_run_id: runId })
       .eq("id", agency.id);
 
-    // log run
     await supabase.from("agency_runs").insert({
       agency_id: agency.id,
       apify_run_id: runId,
@@ -102,7 +101,7 @@ app.post("/apify-webhook", async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // 2️⃣ dataset
+    // 2️⃣ dataset Apify
     const runRes = await axios.get(
       `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
     );
@@ -116,8 +115,9 @@ app.post("/apify-webhook", async (req, res) => {
     const items = itemsRes.data;
     let newCount = 0;
 
+    // 3️⃣ processa annunci
     for (const item of items) {
-      // listings globali
+      // salva listing globale
       await supabase.from("listings").upsert({
         id: item.id,
         title: item.title,
@@ -128,7 +128,7 @@ app.post("/apify-webhook", async (req, res) => {
         raw: item.raw,
       });
 
-      // relazione agenzia-annuncio
+      // 🔑 collega SEMPRE annuncio ↔ agenzia
       const { data: exists } = await supabase
         .from("agency_listings")
         .select("listing_id")
@@ -145,7 +145,7 @@ app.post("/apify-webhook", async (req, res) => {
       }
     }
 
-    // aggiorna ultimo run
+    // 4️⃣ aggiorna run
     await supabase
       .from("agency_runs")
       .update({
