@@ -8,11 +8,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ================= SUPABASE =================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ================= APIFY =================
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const ACTOR_ID = process.env.APIFY_ACTOR_ID;
 
@@ -31,13 +33,13 @@ app.post("/run-agency", async (req, res) => {
       return res.status(400).json({ error: "agency_id mancante" });
     }
 
-    const { data: agency } = await supabase
+    const { data: agency, error } = await supabase
       .from("agencies")
       .select("*")
       .eq("id", agency_id)
       .single();
 
-    if (!agency) {
+    if (error || !agency) {
       return res.status(404).json({ error: "agenzia non trovata" });
     }
 
@@ -55,22 +57,15 @@ app.post("/run-agency", async (req, res) => {
 
     const runId = runRes.data.data.id;
 
-    const { data: run } = await supabase
-      .from("agency_runs")
-      .insert({
-        agency_id: agency.id,
-        apify_run_id: runId,
-        new_listings_count: 0,
-        run_started_at: new Date().toISOString(),
-      })
-      .select()
-      .single();
-
-    res.json({
-      ok: true,
-      run_id: run.id,
+    // ✅ salva SEMPRE il run (senza leggere id di ritorno)
+    await supabase.from("agency_runs").insert({
+      agency_id: agency.id,
       apify_run_id: runId,
+      new_listings_count: 0,
+      run_started_at: new Date().toISOString(),
     });
+
+    res.json({ ok: true, apify_run_id: runId });
   } catch (err) {
     console.error("❌ RUN AGENCY:", err.message);
     res.status(500).json({ error: err.message });
@@ -78,7 +73,7 @@ app.post("/run-agency", async (req, res) => {
 });
 
 // ======================================================
-// 🔔 APIFY WEBHOOK (ROBUSTO)
+// 🔔 APIFY WEBHOOK
 // ======================================================
 app.post("/apify-webhook", async (req, res) => {
   try {
@@ -87,7 +82,7 @@ app.post("/apify-webhook", async (req, res) => {
 
     console.log("🔔 Webhook ricevuto:", runId);
 
-    // ✅ MAI usare single() qui
+    // 1️⃣ trova run
     const { data: runs } = await supabase
       .from("agency_runs")
       .select("*")
@@ -101,12 +96,14 @@ app.post("/apify-webhook", async (req, res) => {
 
     const run = runs[0];
 
+    // 2️⃣ carica agenzia
     const { data: agency } = await supabase
       .from("agencies")
       .select("*")
       .eq("id", run.agency_id)
       .single();
 
+    // 3️⃣ dataset Apify
     const runRes = await axios.get(
       `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
     );
@@ -133,13 +130,13 @@ app.post("/apify-webhook", async (req, res) => {
         first_seen_at: new Date().toISOString(),
       });
 
-      // relazione RUN ↔ LISTING (SEMPRE)
+      // collegamento run → listing (SEMPRE)
       await supabase.from("agency_run_listings").upsert({
         run_id: run.id,
         listing_id: item.id,
       });
 
-      // relazione AGENCY ↔ LISTING (solo se nuovo)
+      // collegamento agenzia → listing (solo se nuovo)
       const { data: exists } = await supabase
         .from("agency_listings")
         .select("listing_id")
@@ -156,6 +153,7 @@ app.post("/apify-webhook", async (req, res) => {
       }
     }
 
+    // 4️⃣ aggiorna run
     await supabase
       .from("agency_runs")
       .update({
@@ -165,6 +163,7 @@ app.post("/apify-webhook", async (req, res) => {
       .eq("id", run.id);
 
     console.log(`✅ ${newCount} nuovi annunci`);
+
     res.json({ ok: true });
   } catch (err) {
     console.error("❌ WEBHOOK:", err.message);
