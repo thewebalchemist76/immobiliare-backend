@@ -8,13 +8,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ================= SUPABASE =================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ================= APIFY =================
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const ACTOR_ID = process.env.APIFY_ACTOR_ID;
 
@@ -33,20 +31,20 @@ app.post("/run-agency", async (req, res) => {
       return res.status(400).json({ error: "agency_id mancante" });
     }
 
-    const { data: agency, error } = await supabase
+    const { data: agency } = await supabase
       .from("agencies")
       .select("*")
       .eq("id", agency_id)
       .single();
 
-    if (error || !agency) {
+    if (!agency) {
       return res.status(404).json({ error: "agenzia non trovata" });
     }
 
     const actorInput = {
       points: agency.points,
       operation: "vendita",
-      max_items: 2,
+      max_items: 20,
     };
 
     const runRes = await axios.post(
@@ -57,15 +55,14 @@ app.post("/run-agency", async (req, res) => {
 
     const runId = runRes.data.data.id;
 
-    // ✅ salva SEMPRE il run (senza leggere id di ritorno)
     await supabase.from("agency_runs").insert({
       agency_id: agency.id,
       apify_run_id: runId,
+      run_date: new Date().toISOString().slice(0, 10),
       new_listings_count: 0,
-      run_started_at: new Date().toISOString(),
     });
 
-    res.json({ ok: true, apify_run_id: runId });
+    res.json({ ok: true, runId });
   } catch (err) {
     console.error("❌ RUN AGENCY:", err.message);
     res.status(500).json({ error: err.message });
@@ -82,33 +79,22 @@ app.post("/apify-webhook", async (req, res) => {
 
     console.log("🔔 Webhook ricevuto:", runId);
 
-    // 1️⃣ trova run
-    const { data: runs } = await supabase
+    const { data: run } = await supabase
       .from("agency_runs")
       .select("*")
       .eq("apify_run_id", runId)
-      .limit(1);
+      .single();
 
-    if (!runs || runs.length === 0) {
-      console.warn("⚠️ agency_run non trovato per run", runId);
+    if (!run) {
+      console.warn("⚠️ agency_run non trovato");
       return res.json({ ok: true });
     }
 
-    const run = runs[0];
-
-    // 2️⃣ carica agenzia
-    const { data: agency } = await supabase
-      .from("agencies")
-      .select("*")
-      .eq("id", run.agency_id)
-      .single();
-
-    // 3️⃣ dataset Apify
-    const runRes = await axios.get(
+    const runInfo = await axios.get(
       `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
     );
 
-    const datasetId = runRes.data.data.defaultDatasetId;
+    const datasetId = runInfo.data.data.defaultDatasetId;
 
     const itemsRes = await axios.get(
       `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
@@ -118,7 +104,6 @@ app.post("/apify-webhook", async (req, res) => {
     let newCount = 0;
 
     for (const item of items) {
-      // listings globali
       await supabase.from("listings").upsert({
         id: item.id,
         title: item.title,
@@ -130,35 +115,27 @@ app.post("/apify-webhook", async (req, res) => {
         first_seen_at: new Date().toISOString(),
       });
 
-      // collegamento run → listing (SEMPRE)
-      await supabase.from("agency_run_listings").upsert({
-        run_id: run.id,
-        listing_id: item.id,
-      });
-
-      // collegamento agenzia → listing (solo se nuovo)
       const { data: exists } = await supabase
         .from("agency_listings")
         .select("listing_id")
-        .eq("agency_id", agency.id)
+        .eq("agency_id", run.agency_id)
         .eq("listing_id", item.id)
         .maybeSingle();
 
       if (!exists) {
         await supabase.from("agency_listings").insert({
-          agency_id: agency.id,
+          agency_id: run.agency_id,
           listing_id: item.id,
         });
         newCount++;
       }
     }
 
-    // 4️⃣ aggiorna run
     await supabase
       .from("agency_runs")
       .update({
         new_listings_count: newCount,
-        run_completed_at: new Date().toISOString(),
+        total_listings: items.length,
       })
       .eq("id", run.id);
 
