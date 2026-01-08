@@ -1,4 +1,3 @@
-// index.js
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -25,50 +24,58 @@ app.get("/", (_req, res) => {
 });
 
 // ======================================================
-// 👤 INVITE AGENT (TL)
+// helpers
+// ======================================================
+function getBearerToken(req) {
+  const h = req.headers?.authorization || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
+
+async function requireTL(req, agency_id) {
+  const token = getBearerToken(req);
+  if (!token) return { ok: false, status: 401, error: "Missing Authorization Bearer token" };
+
+  const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+  if (userErr || !userData?.user?.id) {
+    return { ok: false, status: 401, error: "Invalid session token" };
+  }
+
+  const uid = userData.user.id;
+
+  const { data: me, error: meErr } = await supabase
+    .from("agents")
+    .select("user_id, role, agency_id")
+    .eq("user_id", uid)
+    .maybeSingle();
+
+  if (meErr) return { ok: false, status: 500, error: meErr.message };
+  if (!me) return { ok: false, status: 403, error: "No agent profile" };
+  if (me.role !== "tl") return { ok: false, status: 403, error: "Not TL" };
+  if (!me.agency_id || me.agency_id !== agency_id)
+    return { ok: false, status: 403, error: "TL not in this agency" };
+
+  return { ok: true, uid, me };
+}
+
+// ======================================================
+// 👤 INVITE AGENT (TL only)
 // ======================================================
 app.post("/invite-agent", async (req, res) => {
   try {
-    const { agency_id, email, first_name, last_name, role } = req.body || {};
-
+    const { agency_id, email, first_name, last_name } = req.body || {};
     if (!agency_id) return res.status(400).json({ error: "agency_id mancante" });
     if (!email) return res.status(400).json({ error: "email mancante" });
 
+    // auth: only TL of same agency can invite
+    const guard = await requireTL(req, agency_id);
+    if (!guard.ok) return res.status(guard.status).json({ error: guard.error });
+
     const emailLower = String(email).trim().toLowerCase();
-    const safeRole = role === "tl" ? "tl" : "agent";
+    const fn = first_name ? String(first_name).trim() : null;
+    const ln = last_name ? String(last_name).trim() : null;
 
-    // 1) upsert logico su agents (per agency + email)
-    const { data: existing, error: existingErr } = await supabase
-      .from("agents")
-      .select("id, email, agency_id, user_id, role")
-      .eq("agency_id", agency_id)
-      .eq("email", emailLower)
-      .maybeSingle();
-
-    if (existingErr) return res.status(500).json({ error: existingErr.message });
-
-    if (!existing) {
-      const { error: insErr } = await supabase.from("agents").insert({
-        agency_id,
-        email: emailLower,
-        first_name: first_name ?? null,
-        last_name: last_name ?? null,
-        role: safeRole,
-      });
-      if (insErr) return res.status(500).json({ error: insErr.message });
-    } else {
-      const { error: updErr } = await supabase
-        .from("agents")
-        .update({
-          first_name: first_name ?? null,
-          last_name: last_name ?? null,
-          role: existing.role || safeRole,
-        })
-        .eq("id", existing.id);
-      if (updErr) return res.status(500).json({ error: updErr.message });
-    }
-
-    // 2) invito Supabase (manda email)
+    // create/invite user in Supabase Auth
     const { data: inviteData, error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
       emailLower,
       {
@@ -79,7 +86,41 @@ app.post("/invite-agent", async (req, res) => {
 
     if (inviteErr) return res.status(500).json({ error: inviteErr.message });
 
-    res.json({ ok: true, invited: emailLower, user: inviteData?.user || null });
+    const invitedUserId = inviteData?.user?.id || null;
+
+    // upsert agents row (by agency_id + email)
+    const { data: existing, error: existingErr } = await supabase
+      .from("agents")
+      .select("id, user_id")
+      .eq("agency_id", agency_id)
+      .eq("email", emailLower)
+      .maybeSingle();
+
+    if (existingErr) return res.status(500).json({ error: existingErr.message });
+
+    if (!existing) {
+      const { error: insErr } = await supabase.from("agents").insert({
+        agency_id,
+        email: emailLower,
+        first_name: fn,
+        last_name: ln,
+        role: "agent",
+        user_id: invitedUserId,
+      });
+      if (insErr) return res.status(500).json({ error: insErr.message });
+    } else {
+      const patch = {
+        first_name: fn,
+        last_name: ln,
+      };
+      // se non c’era user_id, lo settiamo dall’invite
+      if (!existing.user_id && invitedUserId) patch.user_id = invitedUserId;
+
+      const { error: updErr } = await supabase.from("agents").update(patch).eq("id", existing.id);
+      if (updErr) return res.status(500).json({ error: updErr.message });
+    }
+
+    res.json({ ok: true, invited: emailLower, user_id: invitedUserId });
   } catch (err) {
     console.error("❌ INVITE AGENT:", err.message);
     res.status(500).json({ error: err.message });
@@ -145,14 +186,21 @@ app.post("/apify-webhook", async (req, res) => {
 
     console.log("🔔 Webhook ricevuto:", apifyRunId);
 
-    const { data: run } = await supabase.from("agency_runs").select("*").eq("apify_run_id", apifyRunId).single();
+    const { data: run } = await supabase
+      .from("agency_runs")
+      .select("*")
+      .eq("apify_run_id", apifyRunId)
+      .single();
 
     if (!run) {
       console.warn("⚠️ agency_run non trovato");
       return res.json({ ok: true });
     }
 
-    const runInfo = await axios.get(`https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${APIFY_TOKEN}`);
+    const runInfo = await axios.get(
+      `https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${APIFY_TOKEN}`
+    );
+
     const datasetId = runInfo.data.data.defaultDatasetId;
 
     const itemsRes = await axios.get(
