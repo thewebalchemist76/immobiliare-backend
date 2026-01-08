@@ -1,3 +1,4 @@
+// index.js
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -9,18 +10,80 @@ app.use(cors());
 app.use(express.json());
 
 // ================= SUPABASE =================
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // ================= APIFY =================
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const ACTOR_ID = process.env.APIFY_ACTOR_ID;
 
+// ================= FRONTEND URL (invite redirect) =================
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
 // ================= HEALTH =================
 app.get("/", (_req, res) => {
   res.json({ status: "backend ok" });
+});
+
+// ======================================================
+// 👤 INVITE AGENT (TL)
+// ======================================================
+app.post("/invite-agent", async (req, res) => {
+  try {
+    const { agency_id, email, first_name, last_name, role } = req.body || {};
+
+    if (!agency_id) return res.status(400).json({ error: "agency_id mancante" });
+    if (!email) return res.status(400).json({ error: "email mancante" });
+
+    const emailLower = String(email).trim().toLowerCase();
+    const safeRole = role === "tl" ? "tl" : "agent";
+
+    // 1) upsert logico su agents (per agency + email)
+    const { data: existing, error: existingErr } = await supabase
+      .from("agents")
+      .select("id, email, agency_id, user_id, role")
+      .eq("agency_id", agency_id)
+      .eq("email", emailLower)
+      .maybeSingle();
+
+    if (existingErr) return res.status(500).json({ error: existingErr.message });
+
+    if (!existing) {
+      const { error: insErr } = await supabase.from("agents").insert({
+        agency_id,
+        email: emailLower,
+        first_name: first_name ?? null,
+        last_name: last_name ?? null,
+        role: safeRole,
+      });
+      if (insErr) return res.status(500).json({ error: insErr.message });
+    } else {
+      const { error: updErr } = await supabase
+        .from("agents")
+        .update({
+          first_name: first_name ?? null,
+          last_name: last_name ?? null,
+          role: existing.role || safeRole,
+        })
+        .eq("id", existing.id);
+      if (updErr) return res.status(500).json({ error: updErr.message });
+    }
+
+    // 2) invito Supabase (manda email)
+    const { data: inviteData, error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
+      emailLower,
+      {
+        redirectTo: FRONTEND_URL,
+        data: { agency_id },
+      }
+    );
+
+    if (inviteErr) return res.status(500).json({ error: inviteErr.message });
+
+    res.json({ ok: true, invited: emailLower, user: inviteData?.user || null });
+  } catch (err) {
+    console.error("❌ INVITE AGENT:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ======================================================
@@ -33,11 +96,7 @@ app.post("/run-agency", async (req, res) => {
       return res.status(400).json({ error: "agency_id mancante" });
     }
 
-    const { data: agency } = await supabase
-      .from("agencies")
-      .select("*")
-      .eq("id", agency_id)
-      .single();
+    const { data: agency } = await supabase.from("agencies").select("*").eq("id", agency_id).single();
 
     if (!agency) {
       return res.status(404).json({ error: "agenzia non trovata" });
@@ -86,21 +145,14 @@ app.post("/apify-webhook", async (req, res) => {
 
     console.log("🔔 Webhook ricevuto:", apifyRunId);
 
-    const { data: run } = await supabase
-      .from("agency_runs")
-      .select("*")
-      .eq("apify_run_id", apifyRunId)
-      .single();
+    const { data: run } = await supabase.from("agency_runs").select("*").eq("apify_run_id", apifyRunId).single();
 
     if (!run) {
       console.warn("⚠️ agency_run non trovato");
       return res.json({ ok: true });
     }
 
-    const runInfo = await axios.get(
-      `https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${APIFY_TOKEN}`
-    );
-
+    const runInfo = await axios.get(`https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${APIFY_TOKEN}`);
     const datasetId = runInfo.data.data.defaultDatasetId;
 
     const itemsRes = await axios.get(
@@ -111,7 +163,6 @@ app.post("/apify-webhook", async (req, res) => {
     let newCount = 0;
 
     for (const item of items) {
-      // listings globali
       await supabase.from("listings").upsert({
         id: item.id,
         title: item.title,
@@ -123,13 +174,11 @@ app.post("/apify-webhook", async (req, res) => {
         first_seen_at: new Date().toISOString(),
       });
 
-      // 🔑 collega SEMPRE al run
       await supabase.from("agency_run_listings").insert({
         run_id: run.id,
         listing_id: item.id,
       });
 
-      // collega all’agenzia (solo se nuovo)
       const { data: exists } = await supabase
         .from("agency_listings")
         .select("listing_id")
