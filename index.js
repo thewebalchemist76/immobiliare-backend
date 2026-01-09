@@ -1,3 +1,4 @@
+// index.js
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -18,6 +19,10 @@ const ACTOR_ID = process.env.APIFY_ACTOR_ID;
 // ================= FRONTEND URL (invite redirect) =================
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
+// ================= CRON SECRET (optional but strongly recommended) =================
+// Set CRON_SECRET on Render (env var). Call endpoint with header: x-cron-secret: <value>
+const CRON_SECRET = process.env.CRON_SECRET || "";
+
 // ================= HEALTH =================
 app.get("/", (_req, res) => {
   res.json({ status: "backend ok" });
@@ -30,6 +35,17 @@ function getBearerToken(req) {
   const h = req.headers?.authorization || "";
   const m = h.match(/^Bearer\s+(.+)$/i);
   return m ? m[1] : null;
+}
+
+function requireCronSecret(req) {
+  if (!CRON_SECRET) return { ok: true }; // allow if not configured (not recommended)
+  const hdr = req.headers["x-cron-secret"];
+  const q = req.query?.secret;
+  const provided = (hdr || q || "").toString();
+  if (!provided || provided !== CRON_SECRET) {
+    return { ok: false, status: 401, error: "Invalid cron secret" };
+  }
+  return { ok: true };
 }
 
 async function requireTL(req, agency_id) {
@@ -128,7 +144,7 @@ app.post("/invite-agent", async (req, res) => {
 });
 
 // ======================================================
-// ▶️ RUN AGENCY
+// ▶️ RUN AGENCY (manuale: usato dal TL dal frontend)
 // ======================================================
 app.post("/run-agency", async (req, res) => {
   try {
@@ -177,7 +193,78 @@ app.post("/run-agency", async (req, res) => {
 });
 
 // ======================================================
-// 🔔 APIFY WEBHOOK
+// ⏰ CRON: RUN ALL AGENCIES (daily)
+// - Create a Render Cron Job that calls this endpoint once a day.
+// - Protect with CRON_SECRET (header x-cron-secret) so nobody can spam runs.
+// ======================================================
+app.post("/cron/run-daily", async (req, res) => {
+  try {
+    const guard = requireCronSecret(req);
+    if (!guard.ok) return res.status(guard.status).json({ error: guard.error });
+
+    const { data: agencies, error: agErr } = await supabase
+      .from("agencies")
+      .select("id, points");
+
+    if (agErr) return res.status(500).json({ error: agErr.message });
+
+    const results = [];
+    for (const agency of agencies || []) {
+      try {
+        if (!agency?.id) continue;
+
+        const actorInput = {
+          points: agency.points,
+          operation: "vendita",
+          max_items: 50,
+        };
+
+        const runRes = await axios.post(
+          `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
+          actorInput,
+          { headers: { "Content-Type": "application/json" } }
+        );
+
+        const apifyRunId = runRes.data.data.id;
+
+        const { data: run, error: runErr } = await supabase
+          .from("agency_runs")
+          .insert({
+            agency_id: agency.id,
+            apify_run_id: apifyRunId,
+            run_date: new Date().toISOString().slice(0, 10),
+            total_listings: 0,
+            new_listings: 0,
+          })
+          .select()
+          .single();
+
+        if (runErr) {
+          results.push({ agency_id: agency.id, ok: false, error: runErr.message });
+          continue;
+        }
+
+        results.push({ agency_id: agency.id, ok: true, run_id: run.id, apify_run_id: apifyRunId });
+      } catch (e) {
+        results.push({ agency_id: agency?.id, ok: false, error: e?.message || "cron error" });
+      }
+    }
+
+    res.json({
+      ok: true,
+      total_agencies: (agencies || []).length,
+      started: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    });
+  } catch (err) {
+    console.error("❌ CRON RUN DAILY:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ======================================================
+// 🔔 APIFY WEBHOOK (quando run finisce, popola listings + join tables)
 // ======================================================
 app.post("/apify-webhook", async (req, res) => {
   try {
