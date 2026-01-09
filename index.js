@@ -46,7 +46,8 @@ function requireCron(req) {
   const provided = bearer || header || query;
   if (!CRON_SECRET) return { ok: false, status: 500, error: "CRON_SECRET non configurato" };
   if (!provided) return { ok: false, status: 401, error: "Missing cron secret" };
-  if (String(provided) !== String(CRON_SECRET)) return { ok: false, status: 403, error: "Invalid cron secret" };
+  if (String(provided) !== String(CRON_SECRET))
+    return { ok: false, status: 403, error: "Invalid cron secret" };
   return { ok: true };
 }
 
@@ -76,8 +77,18 @@ async function requireTL(req, agency_id) {
   return { ok: true, uid, me };
 }
 
+function assertEnv() {
+  const missing = [];
+  if (!process.env.SUPABASE_URL) missing.push("SUPABASE_URL");
+  if (!process.env.SUPABASE_SERVICE_KEY) missing.push("SUPABASE_SERVICE_KEY");
+  if (!APIFY_TOKEN) missing.push("APIFY_TOKEN");
+  if (!ACTOR_ID) missing.push("APIFY_ACTOR_ID");
+  if (missing.length) throw new Error(`Missing env: ${missing.join(", ")}`);
+}
+
 async function startApifyRunAndCreateAgencyRun(agency) {
-  // input Apify
+  assertEnv();
+
   const actorInput = {
     points: agency.points,
     operation: "vendita",
@@ -93,7 +104,7 @@ async function startApifyRunAndCreateAgencyRun(agency) {
   const apifyRunId = runRes?.data?.data?.id;
   if (!apifyRunId) throw new Error("Apify run id mancante");
 
-  // NB: allinea ai campi usati in frontend: total_listings + new_listings_count
+  // NB: usa i campi che il frontend si aspetta: total_listings + new_listings_count
   const { data: run, error: insErr } = await supabase
     .from("agency_runs")
     .insert({
@@ -112,7 +123,7 @@ async function startApifyRunAndCreateAgencyRun(agency) {
 }
 
 // ======================================================
-// 👤 INVITE AGENT (TL only)
+// 👤 INVITE AGENT (TL only)  <-- NON TOCCATO
 // ======================================================
 app.post("/invite-agent", async (req, res) => {
   try {
@@ -173,8 +184,7 @@ app.post("/invite-agent", async (req, res) => {
 });
 
 // ======================================================
-// ▶️ RUN AGENCY (manuale) - lasciato compatibile
-// (se vuoi renderlo TL-only, lo facciamo dopo insieme al frontend)
+// ▶️ RUN AGENCY (manuale) - lasciato compatibile (NON TL-only qui)
 // ======================================================
 app.post("/run-agency", async (req, res) => {
   try {
@@ -199,7 +209,8 @@ app.post("/run-agency", async (req, res) => {
 });
 
 // ======================================================
-// ⏰ CRON: lancia una run per TUTTE le agenzie (sicuro)
+// ⏰ CRON: lancia una run per TUTTE le agenzie
+// Render Cron Job farà POST a questo endpoint alle 06:00
 // ======================================================
 app.post("/cron/daily", async (req, res) => {
   try {
@@ -276,10 +287,25 @@ app.post("/apify-webhook", async (req, res) => {
         price: item.price?.raw ?? null,
         url: item.url,
         raw: item.raw,
-        first_seen_at: new Date().toISOString(),
+        // IMPORTANT: non sovrascrivere first_seen_at se già esiste (mantiene "data acquisizione")
+        // facciamo update dopo con un select, per non cambiare schema.
       });
 
-      // link run->listing (evita doppioni se webhook ritenta)
+      // se first_seen_at è null, settalo (una volta sola)
+      const { data: existingListing, error: exErr } = await supabase
+        .from("listings")
+        .select("id, first_seen_at")
+        .eq("id", item.id)
+        .maybeSingle();
+
+      if (!exErr && existingListing && !existingListing.first_seen_at) {
+        await supabase
+          .from("listings")
+          .update({ first_seen_at: new Date().toISOString() })
+          .eq("id", item.id);
+      }
+
+      // link run->listing (idempotente)
       await supabase.from("agency_run_listings").upsert(
         { run_id: run.id, listing_id: item.id },
         { onConflict: "run_id,listing_id" }
