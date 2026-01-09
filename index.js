@@ -278,63 +278,85 @@ app.post("/apify-webhook", async (req, res) => {
     let newCount = 0;
 
     for (const item of items) {
-      // listings
-      await supabase.from("listings").upsert({
-        id: item.id,
-        title: item.title,
-        city: item.city,
-        province: item.province,
-        price: item.price?.raw ?? null,
-        url: item.url,
-        raw: item.raw,
-        // IMPORTANT: non sovrascrivere first_seen_at se già esiste (mantiene "data acquisizione")
-        // facciamo update dopo con un select, per non cambiare schema.
-      });
+      const nowIso = new Date().toISOString();
 
-      // se first_seen_at è null, settalo (una volta sola)
+      // ============================
+      // listings
+      // FIX first_seen_at:
+      // - set SOLO in INSERT (prima volta che esiste)
+      // - NON toccare in UPDATE
+      // ============================
       const { data: existingListing, error: exErr } = await supabase
         .from("listings")
-        .select("id, first_seen_at")
+        .select("id")
         .eq("id", item.id)
         .maybeSingle();
 
-      if (!exErr && existingListing && !existingListing.first_seen_at) {
-        await supabase
+      if (exErr) throw new Error(exErr.message);
+
+      if (!existingListing) {
+        const { error: insErr } = await supabase.from("listings").insert({
+          id: item.id,
+          title: item.title,
+          city: item.city,
+          province: item.province,
+          price: item.price?.raw ?? null,
+          url: item.url,
+          raw: item.raw,
+          first_seen_at: nowIso,
+        });
+        if (insErr) throw new Error(insErr.message);
+      } else {
+        const { error: updErr } = await supabase
           .from("listings")
-          .update({ first_seen_at: new Date().toISOString() })
+          .update({
+            title: item.title,
+            city: item.city,
+            province: item.province,
+            price: item.price?.raw ?? null,
+            url: item.url,
+            raw: item.raw,
+          })
           .eq("id", item.id);
+        if (updErr) throw new Error(updErr.message);
       }
 
       // link run->listing (idempotente)
-      await supabase.from("agency_run_listings").upsert(
+      const { error: linkErr } = await supabase.from("agency_run_listings").upsert(
         { run_id: run.id, listing_id: item.id },
         { onConflict: "run_id,listing_id" }
       );
+      if (linkErr) throw new Error(linkErr.message);
 
       // agency_listings: conta nuovi
-      const { data: exists } = await supabase
+      const { data: exists, error: existsErr } = await supabase
         .from("agency_listings")
         .select("listing_id")
         .eq("agency_id", run.agency_id)
         .eq("listing_id", item.id)
         .maybeSingle();
 
+      if (existsErr) throw new Error(existsErr.message);
+
       if (!exists) {
-        await supabase.from("agency_listings").insert({
+        const { error: alErr } = await supabase.from("agency_listings").insert({
           agency_id: run.agency_id,
           listing_id: item.id,
         });
+        if (alErr) throw new Error(alErr.message);
         newCount++;
       }
     }
 
-    await supabase
+    const { error: updRunErr } = await supabase
       .from("agency_runs")
       .update({
         total_listings: items.length,
         new_listings_count: newCount,
       })
       .eq("id", run.id);
+
+    if (updRunErr) throw new Error(updRunErr.message);
 
     console.log(`✅ ${newCount} nuovi annunci (run ${run.id})`);
     res.json({ ok: true });
