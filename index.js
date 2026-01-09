@@ -19,14 +19,11 @@ const ACTOR_ID = process.env.APIFY_ACTOR_ID;
 // ================= FRONTEND URL (invite redirect) =================
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
-// ================= CRON SECRET (optional but strongly recommended) =================
-// Set CRON_SECRET on Render (env var). Call endpoint with header: x-cron-secret: <value>
-const CRON_SECRET = process.env.CRON_SECRET || "";
+// ================= CRON SECRET =================
+const CRON_SECRET = process.env.CRON_SECRET;
 
 // ================= HEALTH =================
-app.get("/", (_req, res) => {
-  res.json({ status: "backend ok" });
-});
+app.get("/", (_req, res) => res.json({ status: "backend ok" }));
 
 // ======================================================
 // helpers
@@ -37,14 +34,19 @@ function getBearerToken(req) {
   return m ? m[1] : null;
 }
 
-function requireCronSecret(req) {
-  if (!CRON_SECRET) return { ok: true }; // allow if not configured (not recommended)
-  const hdr = req.headers["x-cron-secret"];
-  const q = req.query?.secret;
-  const provided = (hdr || q || "").toString();
-  if (!provided || provided !== CRON_SECRET) {
-    return { ok: false, status: 401, error: "Invalid cron secret" };
-  }
+function requireCron(req) {
+  // accetta:
+  // - Authorization: Bearer <CRON_SECRET>
+  // - x-cron-secret: <CRON_SECRET>
+  // - ?secret=<CRON_SECRET> (fallback)
+  const bearer = getBearerToken(req);
+  const header = req.headers["x-cron-secret"];
+  const query = req.query?.secret;
+
+  const provided = bearer || header || query;
+  if (!CRON_SECRET) return { ok: false, status: 500, error: "CRON_SECRET non configurato" };
+  if (!provided) return { ok: false, status: 401, error: "Missing cron secret" };
+  if (String(provided) !== String(CRON_SECRET)) return { ok: false, status: 403, error: "Invalid cron secret" };
   return { ok: true };
 }
 
@@ -74,6 +76,41 @@ async function requireTL(req, agency_id) {
   return { ok: true, uid, me };
 }
 
+async function startApifyRunAndCreateAgencyRun(agency) {
+  // input Apify
+  const actorInput = {
+    points: agency.points,
+    operation: "vendita",
+    max_items: 50,
+  };
+
+  const runRes = await axios.post(
+    `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
+    actorInput,
+    { headers: { "Content-Type": "application/json" } }
+  );
+
+  const apifyRunId = runRes?.data?.data?.id;
+  if (!apifyRunId) throw new Error("Apify run id mancante");
+
+  // NB: allinea ai campi usati in frontend: total_listings + new_listings_count
+  const { data: run, error: insErr } = await supabase
+    .from("agency_runs")
+    .insert({
+      agency_id: agency.id,
+      apify_run_id: apifyRunId,
+      run_date: new Date().toISOString().slice(0, 10),
+      total_listings: 0,
+      new_listings_count: 0,
+    })
+    .select()
+    .single();
+
+  if (insErr) throw new Error(insErr.message);
+
+  return { run_id: run.id, apify_run_id: apifyRunId };
+}
+
 // ======================================================
 // 👤 INVITE AGENT (TL only)
 // ======================================================
@@ -94,12 +131,8 @@ app.post("/invite-agent", async (req, res) => {
     // create/invite user in Supabase Auth
     const { data: inviteData, error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
       emailLower,
-      {
-        redirectTo: FRONTEND_URL,
-        data: { agency_id },
-      }
+      { redirectTo: FRONTEND_URL, data: { agency_id } }
     );
-
     if (inviteErr) return res.status(500).json({ error: inviteErr.message });
 
     const invitedUserId = inviteData?.user?.id || null;
@@ -125,11 +158,7 @@ app.post("/invite-agent", async (req, res) => {
       });
       if (insErr) return res.status(500).json({ error: insErr.message });
     } else {
-      const patch = {
-        first_name: fn,
-        last_name: ln,
-      };
-      // se non c’era user_id, lo settiamo dall’invite
+      const patch = { first_name: fn, last_name: ln };
       if (!existing.user_id && invitedUserId) patch.user_id = invitedUserId;
 
       const { error: updErr } = await supabase.from("agents").update(patch).eq("id", existing.id);
@@ -144,48 +173,25 @@ app.post("/invite-agent", async (req, res) => {
 });
 
 // ======================================================
-// ▶️ RUN AGENCY (manuale: usato dal TL dal frontend)
+// ▶️ RUN AGENCY (manuale) - lasciato compatibile
+// (se vuoi renderlo TL-only, lo facciamo dopo insieme al frontend)
 // ======================================================
 app.post("/run-agency", async (req, res) => {
   try {
-    const { agency_id } = req.body;
-    if (!agency_id) {
-      return res.status(400).json({ error: "agency_id mancante" });
-    }
+    const { agency_id } = req.body || {};
+    if (!agency_id) return res.status(400).json({ error: "agency_id mancante" });
 
-    const { data: agency } = await supabase.from("agencies").select("*").eq("id", agency_id).single();
+    const { data: agency, error: aErr } = await supabase
+      .from("agencies")
+      .select("*")
+      .eq("id", agency_id)
+      .maybeSingle();
 
-    if (!agency) {
-      return res.status(404).json({ error: "agenzia non trovata" });
-    }
+    if (aErr) return res.status(500).json({ error: aErr.message });
+    if (!agency) return res.status(404).json({ error: "agenzia non trovata" });
 
-    const actorInput = {
-      points: agency.points,
-      operation: "vendita",
-      max_items: 50,
-    };
-
-    const runRes = await axios.post(
-      `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
-      actorInput,
-      { headers: { "Content-Type": "application/json" } }
-    );
-
-    const apifyRunId = runRes.data.data.id;
-
-    const { data: run } = await supabase
-      .from("agency_runs")
-      .insert({
-        agency_id: agency.id,
-        apify_run_id: apifyRunId,
-        run_date: new Date().toISOString().slice(0, 10),
-        total_listings: 0,
-        new_listings: 0,
-      })
-      .select()
-      .single();
-
-    res.json({ ok: true, run_id: run.id, apify_run_id: apifyRunId });
+    const out = await startApifyRunAndCreateAgencyRun(agency);
+    res.json({ ok: true, ...out });
   } catch (err) {
     console.error("❌ RUN AGENCY:", err.message);
     res.status(500).json({ error: err.message });
@@ -193,78 +199,37 @@ app.post("/run-agency", async (req, res) => {
 });
 
 // ======================================================
-// ⏰ CRON: RUN ALL AGENCIES (daily)
-// - Create a Render Cron Job that calls this endpoint once a day.
-// - Protect with CRON_SECRET (header x-cron-secret) so nobody can spam runs.
+// ⏰ CRON: lancia una run per TUTTE le agenzie (sicuro)
 // ======================================================
-app.post("/cron/run-daily", async (req, res) => {
+app.post("/cron/daily", async (req, res) => {
   try {
-    const guard = requireCronSecret(req);
+    const guard = requireCron(req);
     if (!guard.ok) return res.status(guard.status).json({ error: guard.error });
 
-    const { data: agencies, error: agErr } = await supabase
-      .from("agencies")
-      .select("id, points");
+    const { data: agencies, error } = await supabase.from("agencies").select("id, points");
+    if (error) return res.status(500).json({ error: error.message });
 
-    if (agErr) return res.status(500).json({ error: agErr.message });
+    let started = 0;
+    const errors = [];
 
-    const results = [];
     for (const agency of agencies || []) {
       try {
-        if (!agency?.id) continue;
-
-        const actorInput = {
-          points: agency.points,
-          operation: "vendita",
-          max_items: 50,
-        };
-
-        const runRes = await axios.post(
-          `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
-          actorInput,
-          { headers: { "Content-Type": "application/json" } }
-        );
-
-        const apifyRunId = runRes.data.data.id;
-
-        const { data: run, error: runErr } = await supabase
-          .from("agency_runs")
-          .insert({
-            agency_id: agency.id,
-            apify_run_id: apifyRunId,
-            run_date: new Date().toISOString().slice(0, 10),
-            total_listings: 0,
-            new_listings: 0,
-          })
-          .select()
-          .single();
-
-        if (runErr) {
-          results.push({ agency_id: agency.id, ok: false, error: runErr.message });
-          continue;
-        }
-
-        results.push({ agency_id: agency.id, ok: true, run_id: run.id, apify_run_id: apifyRunId });
+        await startApifyRunAndCreateAgencyRun(agency);
+        started++;
       } catch (e) {
-        results.push({ agency_id: agency?.id, ok: false, error: e?.message || "cron error" });
+        errors.push({ agency_id: agency.id, error: e.message });
       }
     }
 
-    res.json({
-      ok: true,
-      total_agencies: (agencies || []).length,
-      started: results.filter((r) => r.ok).length,
-      failed: results.filter((r) => !r.ok).length,
-      results,
-    });
+    res.json({ ok: true, started, failed: errors.length, errors });
   } catch (err) {
-    console.error("❌ CRON RUN DAILY:", err.message);
+    console.error("❌ CRON DAILY:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ======================================================
-// 🔔 APIFY WEBHOOK (quando run finisce, popola listings + join tables)
+// 🔔 APIFY WEBHOOK (processa il dataset e popola Supabase)
 // ======================================================
 app.post("/apify-webhook", async (req, res) => {
   try {
@@ -273,31 +238,36 @@ app.post("/apify-webhook", async (req, res) => {
 
     console.log("🔔 Webhook ricevuto:", apifyRunId);
 
-    const { data: run } = await supabase
+    const { data: run, error: runErr } = await supabase
       .from("agency_runs")
       .select("*")
       .eq("apify_run_id", apifyRunId)
-      .single();
+      .maybeSingle();
 
+    if (runErr) {
+      console.error("agency_runs lookup error:", runErr.message);
+      return res.json({ ok: true });
+    }
     if (!run) {
-      console.warn("⚠️ agency_run non trovato");
+      console.warn("⚠️ agency_run non trovato per apify_run_id:", apifyRunId);
       return res.json({ ok: true });
     }
 
     const runInfo = await axios.get(
       `https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${APIFY_TOKEN}`
     );
-
-    const datasetId = runInfo.data.data.defaultDatasetId;
+    const datasetId = runInfo?.data?.data?.defaultDatasetId;
+    if (!datasetId) return res.json({ ok: true });
 
     const itemsRes = await axios.get(
       `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
     );
 
-    const items = itemsRes.data;
+    const items = itemsRes.data || [];
     let newCount = 0;
 
     for (const item of items) {
+      // listings
       await supabase.from("listings").upsert({
         id: item.id,
         title: item.title,
@@ -309,11 +279,13 @@ app.post("/apify-webhook", async (req, res) => {
         first_seen_at: new Date().toISOString(),
       });
 
-      await supabase.from("agency_run_listings").insert({
-        run_id: run.id,
-        listing_id: item.id,
-      });
+      // link run->listing (evita doppioni se webhook ritenta)
+      await supabase.from("agency_run_listings").upsert(
+        { run_id: run.id, listing_id: item.id },
+        { onConflict: "run_id,listing_id" }
+      );
 
+      // agency_listings: conta nuovi
       const { data: exists } = await supabase
         .from("agency_listings")
         .select("listing_id")
@@ -334,12 +306,11 @@ app.post("/apify-webhook", async (req, res) => {
       .from("agency_runs")
       .update({
         total_listings: items.length,
-        new_listings: newCount,
+        new_listings_count: newCount,
       })
       .eq("id", run.id);
 
-    console.log(`✅ ${newCount} nuovi annunci`);
-
+    console.log(`✅ ${newCount} nuovi annunci (run ${run.id})`);
     res.json({ ok: true });
   } catch (err) {
     console.error("❌ WEBHOOK:", err.message);
@@ -349,6 +320,4 @@ app.post("/apify-webhook", async (req, res) => {
 
 // ================= START =================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Backend running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
