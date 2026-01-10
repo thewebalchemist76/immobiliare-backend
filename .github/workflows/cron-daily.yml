@@ -1,0 +1,15 @@
+name: Daily cron (agency runs)
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-cron:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call backend cron
+        run: |
+          curl -X POST "${{ secrets.BACKEND_URL }}/cron/daily" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
