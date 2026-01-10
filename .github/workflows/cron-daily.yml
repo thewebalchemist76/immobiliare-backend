@@ -2,6 +2,7 @@ name: Daily cron (agency runs)
 
 on:
   schedule:
+    # 05:00 UTC = 06:00 ora italiana (inverno)
     - cron: "0 5 * * *"
   workflow_dispatch:
 
@@ -11,5 +12,7 @@ jobs:
     steps:
       - name: Call backend cron
         run: |
-          curl -X POST "${{ secrets.BACKEND_URL }}/cron/daily" \
-            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
+          curl --fail --show-error --location \
+               --max-time 30 \
+               -X POST "${{ secrets.BACKEND_URL }}/cron/daily" \
+               -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
