@@ -10,6 +10,11 @@ jobs:
   run-cron:
     runs-on: ubuntu-latest
     steps:
+      - name: Debug URL
+        run: |
+          echo "BACKEND_URL=${{ secrets.BACKEND_URL }}"
+          curl -i --max-time 20 "${{ secrets.BACKEND_URL }}/"
+
       - name: Call backend cron
         run: |
           curl --fail --show-error --location \
