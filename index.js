@@ -10,10 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 // ================= SUPABASE =================
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // ================= APIFY =================
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
@@ -27,6 +24,7 @@ const CRON_SECRET = process.env.CRON_SECRET;
 
 // ================= HEALTH =================
 app.get("/", (_req, res) => res.json({ status: "backend ok" }));
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 // ======================================================
 // helpers
@@ -45,10 +43,14 @@ function requireCron(req) {
 
   if (!CRON_SECRET) return { ok: false, status: 500, error: "CRON_SECRET non configurato" };
   if (!provided) return { ok: false, status: 401, error: "Missing cron secret" };
-  if (String(provided) !== String(CRON_SECRET))
-    return { ok: false, status: 403, error: "Invalid cron secret" };
+  if (String(provided) !== String(CRON_SECRET)) return { ok: false, status: 403, error: "Invalid cron secret" };
 
   return { ok: true };
+}
+
+function isUuid(v) {
+  const s = String(v || "");
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
 }
 
 function assertEnv() {
@@ -62,6 +64,10 @@ function assertEnv() {
 
 async function startApifyRunAndCreateAgencyRun(agency) {
   assertEnv();
+
+  if (!agency?.id || !isUuid(agency.id)) {
+    throw new Error(`agency.id non valido (uuid): "${agency?.id}"`);
+  }
 
   const actorInput = {
     points: agency.points,
@@ -102,12 +108,9 @@ app.post("/run-agency", async (req, res) => {
   try {
     const { agency_id } = req.body || {};
     if (!agency_id) return res.status(400).json({ error: "agency_id mancante" });
+    if (!isUuid(agency_id)) return res.status(400).json({ error: `agency_id non valido (uuid): "${agency_id}"` });
 
-    const { data: agency, error } = await supabase
-      .from("agencies")
-      .select("*")
-      .eq("id", agency_id)
-      .maybeSingle();
+    const { data: agency, error } = await supabase.from("agencies").select("*").eq("id", agency_id).maybeSingle();
 
     if (error) return res.status(500).json({ error: error.message });
     if (!agency) return res.status(404).json({ error: "agenzia non trovata" });
@@ -121,7 +124,7 @@ app.post("/run-agency", async (req, res) => {
 });
 
 // ======================================================
-// ⏰ CRON DAILY
+// ⏰ CRON DAILY (tutte le agenzie)
 // ======================================================
 app.post("/cron/daily", async (req, res) => {
   try {
@@ -136,10 +139,14 @@ app.post("/cron/daily", async (req, res) => {
 
     for (const agency of agencies || []) {
       try {
+        if (!agency?.id || !isUuid(agency.id)) {
+          errors.push({ agency_id: agency?.id ?? null, error: `agency_id non valido (uuid): "${agency?.id}"` });
+          continue;
+        }
         await startApifyRunAndCreateAgencyRun(agency);
         started++;
       } catch (e) {
-        errors.push({ agency_id: agency.id, error: e.message });
+        errors.push({ agency_id: agency?.id ?? null, error: e.message });
       }
     }
 
@@ -158,35 +165,28 @@ app.post("/apify-webhook", async (req, res) => {
     const apifyRunId = req.body?.resource?.id;
     if (!apifyRunId) return res.json({ ok: true });
 
-    const { data: run, error: runErr } = await supabase
-      .from("agency_runs")
-      .select("*")
-      .eq("apify_run_id", apifyRunId)
-      .maybeSingle();
-
+    const { data: run, error: runErr } = await supabase.from("agency_runs").select("*").eq("apify_run_id", apifyRunId).maybeSingle();
     if (runErr || !run) return res.json({ ok: true });
 
-    const runInfo = await axios.get(
-      `https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${APIFY_TOKEN}`
-    );
+    const runInfo = await axios.get(`https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${APIFY_TOKEN}`);
     const datasetId = runInfo?.data?.data?.defaultDatasetId;
     if (!datasetId) return res.json({ ok: true });
 
-    const itemsRes = await axios.get(
-      `https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`
-    );
-
+    const itemsRes = await axios.get(`https://api.apify.com/v2/datasets/${datasetId}/items?clean=true&token=${APIFY_TOKEN}`);
     const items = itemsRes.data || [];
+
     let newCount = 0;
 
     for (const item of items) {
       const nowIso = new Date().toISOString();
 
-      const { data: existing } = await supabase
+      const { data: existing, error: exErr } = await supabase
         .from("listings")
         .select("id, source_agency_id")
         .eq("id", item.id)
         .maybeSingle();
+
+      if (exErr) throw new Error(exErr.message);
 
       if (!existing) {
         const { error: insErr } = await supabase.from("listings").insert({
@@ -216,42 +216,44 @@ app.post("/apify-webhook", async (req, res) => {
         if (updErr) throw new Error(updErr.message);
       }
 
-      await supabase.from("agency_run_listings").upsert(
-        { run_id: run.id, listing_id: item.id },
-        { onConflict: "run_id,listing_id" }
-      );
+      {
+        const { error: arlErr } = await supabase
+          .from("agency_run_listings")
+          .upsert({ run_id: run.id, listing_id: item.id }, { onConflict: "run_id,listing_id" });
+        if (arlErr) throw new Error(arlErr.message);
+      }
 
-      const sourceOk =
-        !existing || existing.source_agency_id === run.agency_id;
+      const sourceOk = !existing || existing.source_agency_id === run.agency_id;
 
       if (sourceOk) {
-        const { data: exists } = await supabase
+        const { data: exists, error: alSelErr } = await supabase
           .from("agency_listings")
           .select("listing_id")
           .eq("agency_id", run.agency_id)
           .eq("listing_id", item.id)
           .maybeSingle();
 
+        if (alSelErr) throw new Error(alSelErr.message);
+
         if (!exists) {
-          const { error: alErr } = await supabase
-            .from("agency_listings")
-            .insert({
-              agency_id: run.agency_id,
-              listing_id: item.id,
-            });
+          const { error: alErr } = await supabase.from("agency_listings").insert({
+            agency_id: run.agency_id,
+            listing_id: item.id,
+          });
           if (alErr) throw new Error(alErr.message);
           newCount++;
         }
       }
     }
 
-    await supabase
-      .from("agency_runs")
-      .update({
-        total_listings: items.length,
-        new_listings_count: newCount,
-      })
-      .eq("id", run.id);
+    {
+      const { error: updRunErr } = await supabase
+        .from("agency_runs")
+        .update({ total_listings: items.length, new_listings_count: newCount })
+        .eq("id", run.id);
+
+      if (updRunErr) throw new Error(updRunErr.message);
+    }
 
     res.json({ ok: true });
   } catch (err) {
