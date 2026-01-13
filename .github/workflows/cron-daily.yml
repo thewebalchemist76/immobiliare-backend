@@ -2,22 +2,30 @@ name: Daily cron (agency runs)
 
 on:
   schedule:
-    # 05:00 UTC = 06:00 ora italiana (inverno)
     - cron: "0 5 * * *"
   workflow_dispatch:
 
 jobs:
   run-cron:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Debug URL
+      - name: Debug URL (masked)
         run: |
-          echo "BACKEND_URL=${{ secrets.BACKEND_URL }}"
-          curl -i --max-time 20 "${{ secrets.BACKEND_URL }}/"
+          echo "BACKEND_URL=***"
+          echo "Hitting health..."
+          curl -i \
+            --retry 6 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 10 --max-time 90 \
+            "${{ secrets.BACKEND_URL }}/"
 
       - name: Call backend cron
         run: |
-          curl --fail --show-error --location \
-               --max-time 30 \
-               -X POST "${{ secrets.BACKEND_URL }}/cron/daily" \
-               -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
+          echo "Triggering /cron/daily..."
+          curl -i \
+            --retry 6 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 10 --max-time 180 \
+            --fail --show-error --location \
+            -X POST "${{ secrets.BACKEND_URL }}/cron/daily" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
