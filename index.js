@@ -28,7 +28,12 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.get("/diag/supabase-auth", async (_req, res) => {
   try {
     const t0 = Date.now();
-    const r = await fetch(`${process.env.SUPABASE_URL}/auth/v1/health`);
+    const r = await fetch(`${process.env.SUPABASE_URL}/auth/v1/health`, {
+      headers: {
+        apikey: process.env.SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+      },
+    });
     const ms = Date.now() - t0;
     const body = await r.text();
     res.status(200).json({ ok: r.ok, status: r.status, ms, body: body || null });
