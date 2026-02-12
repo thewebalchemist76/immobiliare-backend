@@ -206,10 +206,12 @@ app.post("/invite-agent", async (req, res) => {
     if (agentErr) return res.status(500).json({ error: agentErr.message || String(agentErr) });
     if (!agent || agent.role !== "tl") return res.status(403).json({ error: "Permesso negato" });
 
-    const { agency_id, email, first_name, last_name } = req.body || {};
+    const { agency_id, email, first_name, last_name, role } = req.body || {};
     if (!agency_id) return res.status(400).json({ error: "agency_id mancante" });
     if (!isUuid(agency_id)) return res.status(400).json({ error: `agency_id non valido (uuid): "${agency_id}"` });
     if (!email || !isEmail(email)) return res.status(400).json({ error: "email non valida" });
+    if (role && !["agent", "tl"].includes(role)) return res.status(400).json({ error: "role non valido" });
+    const inviteRole = role === "tl" ? "tl" : "agent";
 
     const { data: agency, error: agencyErr } = await supabase.from("agencies").select("id").eq("id", agency_id).maybeSingle();
     if (agencyErr) return res.status(500).json({ error: agencyErr.message });
@@ -221,7 +223,7 @@ app.post("/invite-agent", async (req, res) => {
         first_name: first_name || null,
         last_name: last_name || null,
         agency_id,
-        role: "agent",
+        role: inviteRole,
       },
     });
     if (inviteErr) {
@@ -242,7 +244,7 @@ app.post("/invite-agent", async (req, res) => {
       const payload = {
         user_id: userId,
         email,
-        role: "agent",
+        role: inviteRole,
         agency_id,
         first_name: first_name || null,
         last_name: last_name || null,
