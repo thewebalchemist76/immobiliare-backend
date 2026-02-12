@@ -53,6 +53,47 @@ function isUuid(v) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
 }
 
+function isEmail(v) {
+  const s = String(v || "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+async function getAuthUser(req) {
+  const token = getBearerToken(req);
+  if (!token) return { user: null, error: "Missing bearer token" };
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return { user: null, error: error?.message || "Invalid token" };
+  return { user: data.user, error: null };
+}
+
+async function getAgentProfileByUser(user) {
+  const uid = user?.id;
+  const email = user?.email;
+  if (!uid && !email) return { agent: null, error: "Missing user id/email" };
+
+  const tryQuery = async (qb) => {
+    const { data, error } = await qb.maybeSingle();
+    if (error) return { data: null, error };
+    return { data, error: null };
+  };
+
+  let res = null;
+  if (uid) {
+    res = await tryQuery(supabase.from("agents").select("id,user_id,email,role,agency_id").eq("id", uid));
+    if (res?.data) return { agent: res.data, error: null };
+
+    res = await tryQuery(supabase.from("agents").select("id,user_id,email,role,agency_id").eq("user_id", uid));
+    if (res?.data) return { agent: res.data, error: null };
+  }
+
+  if (email) {
+    res = await tryQuery(supabase.from("agents").select("id,user_id,email,role,agency_id").eq("email", email));
+    if (res?.data) return { agent: res.data, error: null };
+  }
+
+  return { agent: null, error: null };
+}
+
 function assertEnv() {
   const missing = [];
   if (!process.env.SUPABASE_URL) missing.push("SUPABASE_URL");
@@ -119,6 +160,74 @@ app.post("/run-agency", async (req, res) => {
     res.json({ ok: true, ...out });
   } catch (err) {
     console.error("❌ RUN AGENCY:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ======================================================
+// ✉️ INVITE AGENT (solo TL)
+// ======================================================
+app.post("/invite-agent", async (req, res) => {
+  try {
+    assertEnv();
+
+    const { user, error: authErr } = await getAuthUser(req);
+    if (authErr) return res.status(401).json({ error: authErr });
+
+    const { agent, error: agentErr } = await getAgentProfileByUser(user);
+    if (agentErr) return res.status(500).json({ error: agentErr.message || String(agentErr) });
+    if (!agent || agent.role !== "tl") return res.status(403).json({ error: "Permesso negato" });
+
+    const { agency_id, email, first_name, last_name } = req.body || {};
+    if (!agency_id) return res.status(400).json({ error: "agency_id mancante" });
+    if (!isUuid(agency_id)) return res.status(400).json({ error: `agency_id non valido (uuid): "${agency_id}"` });
+    if (!email || !isEmail(email)) return res.status(400).json({ error: "email non valida" });
+
+    const { data: agency, error: agencyErr } = await supabase.from("agencies").select("id").eq("id", agency_id).maybeSingle();
+    if (agencyErr) return res.status(500).json({ error: agencyErr.message });
+    if (!agency) return res.status(404).json({ error: "agenzia non trovata" });
+
+    const { data: invited, error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(email, {
+      redirectTo: FRONTEND_URL,
+      data: {
+        first_name: first_name || null,
+        last_name: last_name || null,
+        agency_id,
+        role: "agent",
+      },
+    });
+    if (inviteErr) return res.status(500).json({ error: inviteErr.message });
+
+    const userId = invited?.user?.id || null;
+    if (userId) {
+      const { data: existing, error: exErr } = await supabase
+        .from("agents")
+        .select("id,user_id,email")
+        .or(`user_id.eq.${userId},email.eq.${email}`)
+        .maybeSingle();
+      if (exErr) return res.status(500).json({ error: exErr.message });
+
+      const payload = {
+        user_id: userId,
+        email,
+        role: "agent",
+        agency_id,
+        first_name: first_name || null,
+        last_name: last_name || null,
+      };
+
+      if (existing?.id) {
+        const { error: updErr } = await supabase.from("agents").update(payload).eq("id", existing.id);
+        if (updErr) return res.status(500).json({ error: updErr.message });
+      } else {
+        const { error: insErr } = await supabase.from("agents").insert(payload);
+        if (insErr) return res.status(500).json({ error: insErr.message });
+      }
+    }
+
+    return res.json({ ok: true, user_id: userId });
+  } catch (err) {
+    console.error("❌ INVITE AGENT:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
