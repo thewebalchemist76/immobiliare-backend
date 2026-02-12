@@ -196,7 +196,14 @@ app.post("/invite-agent", async (req, res) => {
         role: "agent",
       },
     });
-    if (inviteErr) return res.status(500).json({ error: inviteErr.message });
+    if (inviteErr) {
+      const msg =
+        inviteErr.message ||
+        inviteErr.error_description ||
+        inviteErr.code ||
+        (typeof inviteErr === "string" ? inviteErr : JSON.stringify(inviteErr));
+      return res.status(500).json({ error: msg, code: inviteErr.code || null });
+    }
 
     const userId = invited?.user?.id || null;
     if (userId) {
