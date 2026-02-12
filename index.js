@@ -103,6 +103,18 @@ function assertEnv() {
   if (missing.length) throw new Error(`Missing env: ${missing.join(", ")}`);
 }
 
+function errToMessage(err) {
+  if (!err) return "Unknown error";
+  if (typeof err === "string") return err;
+  if (err.message) return err.message;
+  if (err.error_description) return err.error_description;
+  try {
+    return JSON.stringify(err);
+  } catch (_e) {
+    return String(err);
+  }
+}
+
 async function startApifyRunAndCreateAgencyRun(agency) {
   assertEnv();
 
@@ -197,11 +209,8 @@ app.post("/invite-agent", async (req, res) => {
       },
     });
     if (inviteErr) {
-      const msg =
-        inviteErr.message ||
-        inviteErr.error_description ||
-        inviteErr.code ||
-        (typeof inviteErr === "string" ? inviteErr : JSON.stringify(inviteErr));
+      const msg = errToMessage(inviteErr);
+      console.error("❌ INVITE AGENT (Supabase):", inviteErr);
       return res.status(500).json({ error: msg, code: inviteErr.code || null });
     }
 
@@ -234,8 +243,8 @@ app.post("/invite-agent", async (req, res) => {
 
     return res.json({ ok: true, user_id: userId });
   } catch (err) {
-    console.error("❌ INVITE AGENT:", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("❌ INVITE AGENT:", err);
+    res.status(500).json({ error: errToMessage(err) });
   }
 });
 
