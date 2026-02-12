@@ -25,6 +25,17 @@ const CRON_SECRET = process.env.CRON_SECRET;
 // ================= HEALTH =================
 app.get("/", (_req, res) => res.json({ status: "backend ok" }));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
+app.get("/diag/supabase-auth", async (_req, res) => {
+  try {
+    const t0 = Date.now();
+    const r = await fetch(`${process.env.SUPABASE_URL}/auth/v1/health`);
+    const ms = Date.now() - t0;
+    const body = await r.text();
+    res.status(200).json({ ok: r.ok, status: r.status, ms, body: body || null });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
 
 // ======================================================
 // helpers
